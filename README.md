@@ -1,3 +1,5 @@
+# bu proje artık maintain edilmeyecektir
+
 # HDFilmCehennemi Stremio Addon
 
 HDFilmCehennemi içeriklerini Stremio üzerinden izlemenizi sağlayan bir addon.
