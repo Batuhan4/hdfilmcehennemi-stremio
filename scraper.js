@@ -570,6 +570,72 @@ function decodeVideoUrl(parts) {
 }
 
 /**
+ * Map a jwplayer caption label to an ISO-639-1 language code.
+ * Falls back to the first two lower-cased letters of the label.
+ * @param {string} label - Caption label (e.g. "Turkish", "English")
+ * @returns {string} Language code
+ */
+const SUB_LANG_MAP = {
+    turkish: 'tr', 'türkçe': 'tr', turkce: 'tr',
+    english: 'en', forced: 'en',
+    french: 'fr', 'français': 'fr',
+    portuguese: 'pt', spanish: 'es', 'español': 'es',
+    german: 'de', arabic: 'ar', russian: 'ru', italian: 'it'
+};
+function labelToLang(label) {
+    const key = (label || '').trim().toLowerCase();
+    return SUB_LANG_MAP[key] || key.slice(0, 2) || 'und';
+}
+
+/**
+ * Parse subtitles from the embed's jwplayer `setup({ tracks: [...] })` block.
+ *
+ * The current "Close" player declares its subtitle tracks inside the jwplayer
+ * config, not as <video><track> elements, so the <track> scan misses them.
+ * Each entry looks like: {"file":"...vtt","kind":"captions","label":"Turkish","default":true}
+ *
+ * @param {string} html - Raw iframe HTML
+ * @param {string} iframeSrc - Iframe URL (for resolving relative vtt paths)
+ * @returns {Array<{id: string, lang: string, label: string, url: string, default: boolean}>}
+ */
+function parseJwSubtitles(html, iframeSrc) {
+    const subs = [];
+    const m = html.match(/tracks:\s*(\[[\s\S]*?\])/);
+    if (!m) return subs;
+
+    let arr;
+    try {
+        arr = JSON.parse(m[1]);
+    } catch {
+        return subs;
+    }
+    if (!Array.isArray(arr)) return subs;
+
+    for (const t of arr) {
+        if (!t || !t.file) continue;
+        if (t.kind && t.kind !== 'captions' && t.kind !== 'subtitles') continue;
+
+        let url;
+        try {
+            url = new URL(t.file, iframeSrc).href;
+        } catch {
+            url = t.file;
+        }
+
+        const label = t.label || '';
+        subs.push({
+            id: `hdfc-jw-${labelToLang(label)}-${subs.length}`,
+            lang: labelToLang(label),
+            label,
+            url,
+            default: !!t.default
+        });
+    }
+
+    return subs;
+}
+
+/**
  * Scrape video and subtitle data from iframe URL
  * @param {string} iframeSrc - Iframe source URL
  * @param {boolean} [fetchAudioTracks=false] - Fetch the m3u8 to enumerate audio tracks
@@ -610,6 +676,14 @@ async function scrapeIframe(iframeSrc, fetchAudioTracks = false) {
             });
         }
     });
+
+    // Also pull subtitles declared inside the jwplayer setup() tracks array —
+    // the current "Close" player lists them there, not as <video><track>.
+    for (const s of parseJwSubtitles(html, iframeSrc)) {
+        if (!result.subtitles.some(x => x.url === s.url)) {
+            result.subtitles.push(s);
+        }
+    }
 
     log.debug(`Found ${result.subtitles.length} subtitles`);
 
@@ -823,9 +897,20 @@ async function getVideoAndSubtitles(pageUrl, options = {}) {
 
 
 /**
- * Convert scraping result to Stremio stream format
- * Audio track selection is handled by Stremio player via m3u8
- * 
+ * Convert scraping result to Stremio stream format.
+ *
+ * When the master m3u8 carries BOTH a Turkish audio group (dubbed) and a
+ * non-Turkish "Original Audio" group, this returns TWO genuinely different
+ * streams:
+ *   - "🎙️ Türkçe Dublaj"     → proxied master with the Turkish audio forced default
+ *   - "📝 Orijinal + Altyazı" → proxied master with the original audio forced
+ *                                default and the Turkish subtitle injected as a
+ *                                DEFAULT=YES subtitle rendition
+ * The audio is forced by the /proxy/m3u8 endpoint (audio=tr|orig), so the two
+ * entries differ in the actual EXT-X-MEDIA DEFAULT flags, not just the label.
+ *
+ * Single-audio titles (and the no-proxy case) return a single stream as before.
+ *
  * @param {Object} result - Scraping result from getVideoAndSubtitles
  * @param {string} [title='HDFilmCehennemi'] - Stream title
  * @param {string} [baseUrl] - Base URL for m3u8 proxy (e.g., https://your-server.com)
@@ -840,41 +925,85 @@ function toStremioStreams(result, title = 'HDFilmCehennemi', baseUrl = null) {
     const embedOrigin = result.embedOrigin || EMBED_BASE;
     const referer = embedOrigin + '/';
 
-    // Generate proxied URL for TV compatibility (libVLC doesn't support proxyHeaders)
-    // PC clients can still use behaviorHints.proxyHeaders
-    let streamUrl = result.videoUrl;
-    if (baseUrl) {
-        // base64url: '+' in plain base64 becomes a space in query strings and corrupts the URL
-        const encodedUrl = Buffer.from(result.videoUrl).toString('base64url');
-        const encodedRef = Buffer.from(referer).toString('base64url');
-        streamUrl = `${baseUrl}/proxy/m3u8?url=${encodedUrl}&ref=${encodedRef}`;
-    }
-
-    // Video server requires Referer header - returns 404 without it
-    // This is for PC clients that support proxyHeaders
-    const behaviorHints = {
+    // Video server requires Referer header - returns 404 without it.
+    // This is for PC clients that support proxyHeaders (TV clients rely on the
+    // /proxy endpoint instead, which libVLC honours).
+    const mkBehaviorHints = (bingeGroup) => ({
         notWebReady: true,
+        ...(bingeGroup ? { bingeGroup } : {}),
         proxyHeaders: {
             request: {
                 'Referer': referer,
                 'Origin': embedOrigin
             }
         }
+    });
+
+    const subtitles = (result.subtitles || []).map(s => ({
+        id: s.id,
+        url: s.url,
+        lang: s.lang,
+        label: s.label
+    }));
+
+    // Build a /proxy/m3u8 URL for the master, with optional extra params
+    // (audio=tr|orig, sub=<base64url vtt url>). base64url keeps '+' out of the
+    // query string (plain base64 '+' decodes as a space and corrupts the URL).
+    const buildProxyUrl = (extra = {}) => {
+        if (!baseUrl) return result.videoUrl;
+        const params = new URLSearchParams();
+        params.set('url', Buffer.from(result.videoUrl).toString('base64url'));
+        params.set('ref', Buffer.from(referer).toString('base64url'));
+        for (const [k, v] of Object.entries(extra)) params.set(k, v);
+        return `${baseUrl}/proxy/m3u8?${params.toString()}`;
     };
 
-    // Return single stream - audio tracks selectable via player from m3u8
+    // Detect a dual-audio master: a Turkish (dubbed) group + a non-Turkish
+    // (original) group. Only then does a dublaj/altyazı split make sense.
+    const audioTracks = result.audioTracks || [];
+    const turkishAudio = audioTracks.find(t => /t[üu]rk/i.test(t.name));
+    const originalAudio = audioTracks.find(t => t !== turkishAudio);
+    const canSplit = baseUrl && turkishAudio && originalAudio;
+
+    if (canSplit) {
+        // Turkish subtitle to inject as default on the altyazı entry
+        const turkishSub = (result.subtitles || []).find(
+            s => s.lang === 'tr' || /t[üu]rk/i.test(s.label || '')
+        );
+
+        const altyaziExtra = { audio: 'orig' };
+        if (turkishSub) {
+            altyaziExtra.sub = Buffer.from(turkishSub.url).toString('base64url');
+        }
+
+        return {
+            streams: [
+                {
+                    url: buildProxyUrl({ audio: 'tr' }),
+                    title: `🎙️ Türkçe Dublaj\n${title}`,
+                    name: 'HDFilmCehennemi',
+                    behaviorHints: mkBehaviorHints('hdfc-dublaj'),
+                    subtitles
+                },
+                {
+                    url: buildProxyUrl(altyaziExtra),
+                    title: `📝 Orijinal + Altyazı\n${title}`,
+                    name: 'HDFilmCehennemi',
+                    behaviorHints: mkBehaviorHints('hdfc-altyazi'),
+                    subtitles
+                }
+            ]
+        };
+    }
+
+    // Single-audio (or no-proxy) case: one stream, audio selectable via player.
     return {
         streams: [{
-            url: streamUrl,
+            url: buildProxyUrl(),
             title: title,
             name: 'HDFilmCehennemi',
-            behaviorHints: behaviorHints,
-            subtitles: result.subtitles.map(s => ({
-                id: s.id,
-                url: s.url,
-                lang: s.lang,
-                label: s.label
-            }))
+            behaviorHints: mkBehaviorHints(),
+            subtitles
         }]
     };
 }
