@@ -230,23 +230,27 @@ function upstreamHeaders(referer) {
  * Rewrite all URLs in an m3u8 playlist to go through our /proxy/stream endpoint
  * Handles segment lines, nested playlists, and URI="..." attributes (audio/subtitle tracks)
  *
- * Optionally forces an audio rendition default and injects a default Turkish
- * subtitle into the MASTER playlist, so the dublaj vs altyazı stream entries
- * differ in their actual EXT-X-MEDIA DEFAULT flags:
- *   - opts.audio  = 'tr'   → the Turkish audio group becomes DEFAULT/AUTOSELECT=YES
- *   - opts.audio  = 'orig' → the first non-Turkish audio group becomes default
- *   - opts.subUrl = <url>  → inject a DEFAULT=YES SUBTITLES rendition for it
- * These are no-ops on media (variant) playlists, which carry no audio/stream-inf
- * lines, so the same function is safe for both /proxy/m3u8 and /proxy/stream.
+ * Optionally serves a single-language audio master, so the dublaj vs altyazı
+ * stream entries carry exactly ONE EXT-X-MEDIA:TYPE=AUDIO rendition:
+ *   - opts.audio = 'tr'   → keep the Turkish audio group (DEFAULT/AUTOSELECT=YES),
+ *                            drop every non-Turkish audio rendition
+ *   - opts.audio = 'orig' → keep the non-Turkish audio group, drop the Turkish one
+ * This removes the alternate-audio ambiguity that VLC ignores. It is a no-op on
+ * media (variant) playlists, which carry no audio lines, so the same function is
+ * safe for both /proxy/m3u8 and /proxy/stream.
+ *
+ * Every rewritten URL is given a real media extension on its PATH before the
+ * query string ('/proxy/stream/pl.m3u8?...' for nested playlists, '.../seg.ts?...'
+ * for segments) so ffmpeg >=7.1 (extension_picky=1) accepts it at parse time.
  *
  * @param {string} content - Raw m3u8 content
  * @param {string} playlistUrl - Full URL of the playlist being rewritten (for resolving relative paths)
  * @param {string} ref - Already-encoded ref query parameter to propagate
- * @param {{audio?: string, subUrl?: string}} [opts] - Audio/subtitle forcing options
+ * @param {{audio?: string}} [opts] - Audio forcing option
  * @returns {string} Rewritten playlist
  */
 function rewritePlaylist(content, playlistUrl, ref, opts = {}) {
-    const { audio, subUrl } = opts;
+    const { audio } = opts;
 
     // base64url: safe in query strings ('+' in plain base64 decodes as a space)
     const proxyUrl = (originalUrl) => {
@@ -259,56 +263,40 @@ function rewritePlaylist(content, playlistUrl, ref, opts = {}) {
             return originalUrl; // unresolvable — leave the line untouched
         }
         const encodedUrl = Buffer.from(fullUrl).toString('base64url');
-        return `${BASE_URL}/proxy/stream?url=${encodedUrl}&ref=${ref || ''}`;
+        // Give the proxied path a real media extension BEFORE the query so
+        // ffmpeg >=7.1 (extension_picky=1) accepts it at parse time. Nested
+        // playlists (upstream .m3u8/.txt) get pl.m3u8; segments get seg.ts.
+        const upstreamPath = fullUrl.split('?')[0];
+        const fname = (upstreamPath.endsWith('.m3u8') || upstreamPath.endsWith('.txt'))
+            ? 'pl.m3u8' : 'seg.ts';
+        return `${BASE_URL}/proxy/stream/${fname}?url=${encodedUrl}&ref=${ref || ''}`;
     };
-
-    // Track that we only mark ONE track default per role (valid HLS)
-    let audioDefaulted = false;
-    let subInjected = false;
 
     const out = [];
     for (const line of content.split('\n')) {
         const trimmed = line.trim();
 
-        // Force audio rendition default (master playlist only)
+        // Per-audio master: keep exactly ONE audio rendition, drop the other
+        // language's entirely, and force the survivor DEFAULT=YES,AUTOSELECT=YES.
         if (audio && trimmed.startsWith('#EXT-X-MEDIA:') && /TYPE=AUDIO/.test(trimmed)) {
             const nameMatch = trimmed.match(/NAME="([^"]*)"/);
             const isTurkish = nameMatch && /t[üu]rk/i.test(nameMatch[1]);
-            const wantDefault =
-                !audioDefaulted &&
-                ((audio === 'tr' && isTurkish) || (audio === 'orig' && !isTurkish));
-            if (wantDefault) audioDefaulted = true;
+            const keep = (audio === 'tr' && isTurkish) || (audio === 'orig' && !isTurkish);
+            if (!keep) continue; // drop the other language's audio rendition
 
-            const flag = wantDefault ? 'YES' : 'NO';
             let rewritten = trimmed;
             if (/DEFAULT=(YES|NO)/i.test(rewritten)) {
-                rewritten = rewritten.replace(/DEFAULT=(YES|NO)/i, `DEFAULT=${flag}`);
+                rewritten = rewritten.replace(/DEFAULT=(YES|NO)/i, 'DEFAULT=YES');
             } else {
-                rewritten = rewritten.replace(/(#EXT-X-MEDIA:)/, `$1DEFAULT=${flag},`);
+                rewritten = rewritten.replace(/(#EXT-X-MEDIA:)/, '$1DEFAULT=YES,');
             }
             if (/AUTOSELECT=(YES|NO)/i.test(rewritten)) {
-                rewritten = rewritten.replace(/AUTOSELECT=(YES|NO)/i, `AUTOSELECT=${flag}`);
+                rewritten = rewritten.replace(/AUTOSELECT=(YES|NO)/i, 'AUTOSELECT=YES');
             } else {
-                rewritten = rewritten.replace(/DEFAULT=(YES|NO)/i, `DEFAULT=$1,AUTOSELECT=${flag}`);
+                rewritten = rewritten.replace(/DEFAULT=YES/, 'DEFAULT=YES,AUTOSELECT=YES');
             }
             rewritten = rewritten.replace(/URI="([^"]+)"/g, (m, uri) => `URI="${proxyUrl(uri)}"`);
             out.push(rewritten);
-            continue;
-        }
-
-        // Inject a default Turkish subtitle rendition and wire variants to it
-        if (subUrl && trimmed.startsWith('#EXT-X-STREAM-INF')) {
-            if (!subInjected) {
-                out.push(
-                    '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Türkçe",' +
-                    `LANGUAGE="tr",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,URI="${proxyUrl(subUrl)}"`
-                );
-                subInjected = true;
-            }
-            const withSubs = /SUBTITLES=/.test(trimmed)
-                ? trimmed.replace(/SUBTITLES="[^"]*"/, 'SUBTITLES="subs"')
-                : `${trimmed},SUBTITLES="subs"`;
-            out.push(withSubs);
             continue;
         }
 
@@ -341,7 +329,7 @@ function rewritePlaylist(content, playlistUrl, ref, opts = {}) {
  */
 app.get('/proxy/m3u8', async (req, res) => {
     try {
-        const { url, ref, audio, sub } = req.query;
+        const { url, ref, audio } = req.query;
 
         if (!url) {
             return res.status(400).send('Missing url parameter');
@@ -350,7 +338,6 @@ app.get('/proxy/m3u8', async (req, res) => {
         // Decode base64 parameters (Node accepts both base64 and base64url alphabets)
         const videoUrl = Buffer.from(url, 'base64').toString('utf-8');
         const referer = ref ? Buffer.from(ref, 'base64').toString('utf-8') : '';
-        const subUrl = sub ? Buffer.from(sub, 'base64').toString('utf-8') : null;
 
         log.debug(`Proxy m3u8: ${videoUrl.substring(0, 80)}... (audio=${audio || 'none'})`);
 
@@ -365,9 +352,9 @@ app.get('/proxy/m3u8', async (req, res) => {
             return res.status(response.status).send('Failed to fetch m3u8');
         }
 
-        // Rewrite ALL URLs to go through our proxy, forcing the requested audio
-        // rendition default and injecting a default Turkish subtitle if asked.
-        const content = rewritePlaylist(await response.text(), videoUrl, ref, { audio, subUrl });
+        // Rewrite ALL URLs to go through our proxy, serving a single-language
+        // audio master when an audio preference is requested (audio=tr|orig).
+        const content = rewritePlaylist(await response.text(), videoUrl, ref, { audio });
 
         // Return m3u8 content with proper headers
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
@@ -386,9 +373,14 @@ app.get('/proxy/m3u8', async (req, res) => {
 
 /**
  * Stream Proxy Endpoint - Proxies video segments with Referer header
- * Handles both m3u8 sub-playlists and .ts/.m4s segments
+ * Handles both m3u8 sub-playlists and .ts/.m4s segments.
+ *
+ * Registered on two paths: the bare /proxy/stream (backward compat) and
+ * /proxy/stream/:fname where :fname is a cosmetic real-extension filename
+ * (pl.m3u8 / seg.ts) that lets ffmpeg >=7.1 accept the URL at parse time.
+ * The :fname is ignored; the actual target comes from the ?url= param.
  */
-app.get('/proxy/stream', async (req, res) => {
+async function proxyStreamHandler(req, res) {
     try {
         const { url, ref } = req.query;
 
@@ -423,8 +415,15 @@ app.get('/proxy/stream', async (req, res) => {
             res.set('Cache-Control', 'no-cache');
             res.send(content);
         } else {
-            // Binary content (video/audio segments) - pipe with backpressure handling
-            res.set('Content-Type', contentType || 'video/mp2t');
+            // Binary content (video/audio segments). The CDN mislabels every
+            // segment as image/jpeg (real payload is MPEG-TS), which steers
+            // ExoPlayer's extractor wrongly — force the correct type. VTT (if a
+            // subtitle URL is ever routed here) keeps text/vtt.
+            if (urlPath.toLowerCase().endsWith('.vtt')) {
+                res.set('Content-Type', 'text/vtt');
+            } else {
+                res.set('Content-Type', 'video/mp2t');
+            }
             const contentLength = response.headers.get('content-length');
             if (contentLength) res.set('Content-Length', contentLength);
             res.set('Cache-Control', 'max-age=3600');
@@ -447,7 +446,12 @@ app.get('/proxy/stream', async (req, res) => {
             res.destroy();
         }
     }
-});
+}
+
+// Bare path kept for backward compat; /:fname carries the cosmetic real
+// extension (pl.m3u8 / seg.ts) that ffmpeg >=7.1 needs to accept the URL.
+app.get('/proxy/stream', proxyStreamHandler);
+app.get('/proxy/stream/:fname', proxyStreamHandler);
 
 // Mount Stremio addon router
 app.use(getRouter(builder.getInterface()));

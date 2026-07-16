@@ -902,12 +902,11 @@ async function getVideoAndSubtitles(pageUrl, options = {}) {
  * When the master m3u8 carries BOTH a Turkish audio group (dubbed) and a
  * non-Turkish "Original Audio" group, this returns TWO genuinely different
  * streams:
- *   - "🎙️ Türkçe Dublaj"     → proxied master with the Turkish audio forced default
- *   - "📝 Orijinal + Altyazı" → proxied master with the original audio forced
- *                                default and the Turkish subtitle injected as a
- *                                DEFAULT=YES subtitle rendition
- * The audio is forced by the /proxy/m3u8 endpoint (audio=tr|orig), so the two
- * entries differ in the actual EXT-X-MEDIA DEFAULT flags, not just the label.
+ *   - "🎙️ Türkçe Dublaj"     → proxied master carrying only the Turkish audio
+ *   - "📝 Orijinal + Altyazı" → proxied master carrying only the original audio;
+ *                                Turkish subtitles ride in the Stremio subtitles[]
+ * The /proxy/m3u8 endpoint (audio=tr|orig) drops the other audio rendition, so
+ * each entry is an unambiguous single-language master, not just a relabel.
  *
  * Single-audio titles (and the no-proxy case) return a single stream as before.
  *
@@ -966,16 +965,10 @@ function toStremioStreams(result, title = 'HDFilmCehennemi', baseUrl = null) {
     const canSplit = baseUrl && turkishAudio && originalAudio;
 
     if (canSplit) {
-        // Turkish subtitle to inject as default on the altyazı entry
-        const turkishSub = (result.subtitles || []).find(
-            s => s.lang === 'tr' || /t[üu]rk/i.test(s.label || '')
-        );
-
-        const altyaziExtra = { audio: 'orig' };
-        if (turkishSub) {
-            altyaziExtra.sub = Buffer.from(turkishSub.url).toString('base64url');
-        }
-
+        // Each entry is a single-language audio master (the /proxy/m3u8 endpoint
+        // drops the other audio rendition). Turkish subtitles ride along in the
+        // Stremio subtitles[] array on both entries — clients fetch the VTTs
+        // directly (no referer needed), so no in-manifest SUBTITLES injection.
         return {
             streams: [
                 {
@@ -986,7 +979,7 @@ function toStremioStreams(result, title = 'HDFilmCehennemi', baseUrl = null) {
                     subtitles
                 },
                 {
-                    url: buildProxyUrl(altyaziExtra),
+                    url: buildProxyUrl({ audio: 'orig' }),
                     title: `📝 Orijinal + Altyazı\n${title}`,
                     name: 'HDFilmCehennemi',
                     behaviorHints: mkBehaviorHints('hdfc-altyazi'),
