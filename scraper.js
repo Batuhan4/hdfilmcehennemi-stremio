@@ -938,12 +938,18 @@ function toStremioStreams(result, title = 'HDFilmCehennemi', baseUrl = null) {
         }
     });
 
-    const subtitles = (result.subtitles || []).map(s => ({
-        id: s.id,
-        url: s.url,
-        lang: s.lang,
-        label: s.label
-    }));
+    // We deliberately do NOT surface the site's own subtitles by default —
+    // OpenSubtitles (or any other subtitle addon) gives better, better-synced
+    // results and avoids a confusing duplicate "exclusive" track. Re-enable the
+    // scraped subtitles by setting INCLUDE_SUBTITLES=true in .env if ever needed.
+    const subtitles = process.env.INCLUDE_SUBTITLES === 'true'
+        ? (result.subtitles || []).map(s => ({
+            id: s.id,
+            url: s.url,
+            lang: s.lang,
+            label: s.label
+        }))
+        : [];
 
     // Build a /proxy/m3u8 URL for the master, with optional extra params
     // (audio=tr|orig, sub=<base64url vtt url>). base64url keeps '+' out of the
