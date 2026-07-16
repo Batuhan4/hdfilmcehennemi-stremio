@@ -14,8 +14,12 @@ HDFilmCehennemi içeriklerini Stremio üzerinden izlemenizi sağlayan bir addon.
   - Video akışında backpressure düzeltmesi (`stream.pipeline`) — hızlı kaynak + yavaş istemcide bellek şişmesi önlendi.
   - Çeşitli null-güvenliği, timeout ve çift-gönderim (double-send) düzeltmeleri.
 - **Performans:** başarılı sonuçlar için TTL'li bellek içi cache (tekrar isteklerde ~700 ms → ~3 ms); her istekte yapılan gereksiz ses-parçası (audio track) çekme işlemi opsiyonel hâle getirildi.
+- **Güncel embed formatı çözümü:** site video URL'ini artık sayfa içi bir inline decoder fonksiyonuyla veriyor; `parseInlineDecoder` bu fonksiyonu ayrıştırıp yorumluyor (adım sırası/şifreleme her sayfada değişse de kendini uyarlıyor), eski packed-JS ve JSON-LD yolları fallback olarak duruyor.
+- **Dizi (series) desteği:** `/dizi/` sayfaları Cloudflare'in JA3 (TLS parmak izi) botgeçidinde undici'ye `403` veriyor; bu sayfalarda sistem `curl`'üne düşen bir fallback (`curlClient.js`) ile aşılıyor. Filmler hızlı undici yolunda kalır; fallback yalnızca gerektiğinde tetiklenir.
+- **Dublaj / Altyazı ayrı seçenek:** iki dilli (dual-audio) içeriklerde tek stream yerine **iki ayrı seçenek** sunuluyor — "🎙️ Türkçe Dublaj" ve "📝 Orijinal + Altyazı". Her biri proxied master m3u8'de ilgili ses grubunu `DEFAULT=YES` yapıyor; altyazı seçeneği Türkçe altyazıyı default olarak enjekte ediyor. Tek sesli içerik/dizilerde tek seçenek kalır.
+- **Altyazı düzeltmesi:** altyazılar artık jwplayer `tracks[]` dizisinden de okunuyor (site altyazıları `<video><track>` yerine burada veriyordu, bu yüzden eskiden 0 altyazı dönüyordu).
 
-> **Durum:** HDFilmCehennemi embed/şifreleme formatını sık sık değiştiriyor; video çıkarma (extraction) mantığı bu fork'ta aktif olarak güncel tutulmaktadır. Kullanmadan önce `npm test` ile doğrulayabilirsiniz.
+> **Durum:** HDFilmCehennemi embed/şifreleme formatını sık sık değiştiriyor; extraction bu fork'ta kendini uyarlayan bir inline-decoder ayrıştırıcısıyla güncel tutuluyor ve film + dizi uçtan uca çalışır durumda. Yine de site formatı değiştirdiğinde ara sıra güncelleme gerekebilir; kullanmadan önce `npm test` ile doğrulayabilirsiniz.
 
 ## Özellikler
 
