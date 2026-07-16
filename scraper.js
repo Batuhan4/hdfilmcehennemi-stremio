@@ -12,6 +12,7 @@ const { createLogger } = require('./logger');
 const { ScrapingError, NetworkError, TimeoutError } = require('./errors');
 const { getWorkingProxy, markProxyBad, createProxyAgent, isProxyEnabled, isProxyAlways } = require('./proxy');
 const { SITE_BASE_URL, EMBED_BASE_URL, isHdfilmcehennemiUrl } = require('./config');
+const { curlGet } = require('./curlClient');
 
 const log = createLogger('Scraper');
 
@@ -181,8 +182,23 @@ async function httpGet(url, referer = null) {
                     clearTimeout(timeoutId);
 
                     // Check for Cloudflare block (403)
+                    // The site's /dizi/ (series) pages sit behind a JA3 TLS gate
+                    // that 403s undici but passes the system curl. Retry via curl
+                    // before falling back to the (usually disabled) proxy path.
                     if (response.status === 403 && isHdfilmcehennemiUrl(url)) {
-                        log.warn(`Cloudflare block detected (403), will try proxy...`);
+                        log.warn(`Cloudflare block (403) via undici, retrying via curl: ${url}`);
+                        try {
+                            const { status, body } = await curlGet(url, headers, CONFIG.timeout);
+                            if (status === 200 && body &&
+                                !body.includes('cf-browser-verification') &&
+                                !body.includes('Just a moment')) {
+                                log.info(`✅ curl fallback success: ${url} (${body.length} bytes)`);
+                                return body;
+                            }
+                            log.warn(`curl fallback unusable (status ${status}), will try proxy...`);
+                        } catch (curlErr) {
+                            log.warn(`curl fallback errored: ${curlErr.message}, will try proxy...`);
+                        }
                         lastError = new NetworkError('Cloudflare block (403)', url, 403);
                         useProxy = true;
                         break;

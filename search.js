@@ -12,6 +12,7 @@ const { createLogger } = require('./logger');
 const { ContentNotFoundError, NetworkError, ValidationError, TimeoutError } = require('./errors');
 const { getWorkingProxy, markProxyBad, createProxyAgent, isProxyEnabled, isProxyAlways } = require('./proxy');
 const { SITE_BASE_URL, isHdfilmcehennemiUrl } = require('./config');
+const { curlGet } = require('./curlClient');
 
 const log = createLogger('Search');
 
@@ -62,6 +63,23 @@ function isValidEpisodeNumber(value) {
 }
 
 
+
+/**
+ * Wrap a curl fallback body in a minimal, fetch-Response-compatible object so
+ * callers of fetchWithRetry (which expect `.status`/`.ok`/`.text()`/`.json()`)
+ * work unchanged whether the response came from undici or curl.
+ * @param {number} status - HTTP status code
+ * @param {string} body - Response body text
+ * @returns {{status: number, ok: boolean, text: function(): Promise<string>, json: function(): Promise<Object>}}
+ */
+function makeCurlResponse(status, body) {
+    return {
+        status,
+        ok: status >= 200 && status < 300,
+        text: async () => body,
+        json: async () => JSON.parse(body)
+    };
+}
 
 /**
  * Try to fetch URL using a specific proxy with retries
@@ -153,8 +171,21 @@ async function fetchWithRetry(url, options = {}) {
                     clearTimeout(timeoutId);
 
                     // Check for Cloudflare block (403)
+                    // The site's /dizi/ (series) pages sit behind a JA3 TLS gate
+                    // that 403s undici but passes the system curl. Retry via curl
+                    // before falling back to the (usually disabled) proxy path.
                     if (response.status === 403 && isHdfilmcehennemiUrl(url)) {
-                        log.warn(`Cloudflare block detected (403), will try proxy...`);
+                        log.warn(`Cloudflare block (403) via undici, retrying via curl: ${url}`);
+                        try {
+                            const { status, body } = await curlGet(url, options.headers || defaultHeaders, CONFIG.timeout);
+                            if (status === 200 && body) {
+                                log.info(`✅ curl fallback success: ${url} (${body.length} bytes)`);
+                                return makeCurlResponse(status, body);
+                            }
+                            log.warn(`curl fallback unusable (status ${status}), will try proxy...`);
+                        } catch (curlErr) {
+                            log.warn(`curl fallback errored: ${curlErr.message}, will try proxy...`);
+                        }
                         lastError = new NetworkError('Cloudflare block (403)', url, 403);
                         useProxy = true;
                         break;
