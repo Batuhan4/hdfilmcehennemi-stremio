@@ -7,12 +7,14 @@
  * @module addon
  */
 
-// Load environment variables from .env file
-require('dotenv').config();
+// config loads .env before reading any environment variables
+const { SITE_BASE_URL } = require('./config');
 
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 const express = require('express');
 const { fetch } = require('undici');
+const { pipeline } = require('stream/promises');
+const { Readable } = require('stream');
 const { getVideoAndSubtitles, toStremioStreams } = require('./scraper');
 const { findContent, isValidImdbId } = require('./search');
 const { createLogger } = require('./logger');
@@ -29,7 +31,7 @@ const manifest = {
     version: '1.2.0',
     name: 'HDFilmCehennemi',
     description: 'HDFilmCehennemi üzerinden film ve dizi izleyin. Türkçe dublaj ve altyazı desteği.',
-    logo: 'https://www.hdfilmcehennemi.ws/favicon.ico',
+    logo: `${SITE_BASE_URL}/favicon.ico`,
     resources: ['stream'],
     types: ['movie', 'series'],
     catalogs: [],
@@ -42,12 +44,58 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
+// In-memory caches (success-only, bounded)
+const STREAM_CACHE_TTL = 10 * 60 * 1000;      // resolved streams — short, video URLs can expire
+const CONTENT_URL_CACHE_TTL = 6 * 60 * 60 * 1000; // imdbId -> page URL mapping — stable
+const CACHE_MAX_ENTRIES = 500;
+const streamCache = new Map();     // key: `${type}:${id}` -> { value, expires }
+const contentUrlCache = new Map(); // key: `${type}:${id}` -> { value, expires }
+
+/**
+ * Get a non-expired cache entry, or null
+ * @param {Map} cache - Cache map
+ * @param {string} key - Cache key
+ * @returns {*} Cached value or null
+ */
+function cacheGet(cache, key) {
+    const entry = cache.get(key);
+    if (!entry) return null;
+    if (Date.now() > entry.expires) {
+        cache.delete(key);
+        return null;
+    }
+    return entry.value;
+}
+
+/**
+ * Store a cache entry with TTL, evicting the oldest entry when full
+ * @param {Map} cache - Cache map
+ * @param {string} key - Cache key
+ * @param {*} value - Value to store
+ * @param {number} ttl - Time to live in ms
+ */
+function cacheSet(cache, key, value, ttl) {
+    if (cache.size >= CACHE_MAX_ENTRIES) {
+        cache.delete(cache.keys().next().value);
+    }
+    cache.set(key, { value, expires: Date.now() + ttl });
+}
+
 /**
  * Stream handler - Find content on HDFilmCehennemi and return streams
  */
 builder.defineStreamHandler(async ({ type, id }) => {
     const startTime = Date.now();
     log.info(`Stream request: ${type} - ${id}`);
+
+    const cacheKey = `${type}:${id}`;
+
+    // Serve from cache — Stremio clients often fire the same request repeatedly
+    const cachedStreams = cacheGet(streamCache, cacheKey);
+    if (cachedStreams) {
+        log.info(`Cache hit for ${cacheKey} (${Date.now() - startTime}ms)`);
+        return cachedStreams;
+    }
 
     try {
         // Parse IMDb ID
@@ -64,8 +112,11 @@ builder.defineStreamHandler(async ({ type, id }) => {
             return { streams: [] };
         }
 
-        // Find content on HDFilmCehennemi
-        const content = await findContent(type, imdbId, season, episode);
+        // Find content on HDFilmCehennemi (skip the search round trip when cached)
+        let content = cacheGet(contentUrlCache, cacheKey);
+        if (!content) {
+            content = await findContent(type, imdbId, season, episode);
+        }
 
         log.info(`Content found: ${content.url}`);
 
@@ -74,6 +125,12 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
         // Convert to Stremio format with proxy URL for TV compatibility
         const streams = toStremioStreams(result, content.title, BASE_URL);
+
+        // Cache only on full success so retries stay fresh after failures
+        if (streams.streams.length > 0) {
+            cacheSet(contentUrlCache, cacheKey, content, CONTENT_URL_CACHE_TTL);
+            cacheSet(streamCache, cacheKey, streams, STREAM_CACHE_TTL);
+        }
 
         const elapsed = Date.now() - startTime;
         log.info(`Returning ${streams.streams.length} stream(s) for ${imdbId} (${elapsed}ms)`);
@@ -89,7 +146,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 name: 'HDFilmCehennemi',
                 title: `⚠️ ${title}`,
                 description: description,
-                externalUrl: 'https://www.hdfilmcehennemi.ws'
+                externalUrl: SITE_BASE_URL
             }]
         });
 
@@ -151,12 +208,66 @@ app.use((req, res, next) => {
 });
 
 /**
+ * Build upstream request headers with optional Referer/Origin
+ * @param {string} referer - Referer URL (empty string for none)
+ * @returns {Object} Headers object
+ */
+function upstreamHeaders(referer) {
+    const headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    };
+    if (referer) {
+        headers['Referer'] = referer;
+        try {
+            headers['Origin'] = new URL(referer).origin;
+        } catch { /* malformed referer — send without Origin */ }
+    }
+    return headers;
+}
+
+/**
+ * Rewrite all URLs in an m3u8 playlist to go through our /proxy/stream endpoint
+ * Handles segment lines, nested playlists, and URI="..." attributes (audio/subtitle tracks)
+ * @param {string} content - Raw m3u8 content
+ * @param {string} baseUrl - Base URL for resolving relative paths (with trailing slash)
+ * @param {string} ref - Already-encoded ref query parameter to propagate
+ * @returns {string} Rewritten playlist
+ */
+function rewritePlaylist(content, baseUrl, ref) {
+    // base64url: safe in query strings ('+' in plain base64 decodes as a space)
+    const proxyUrl = (originalUrl) => {
+        const fullUrl = originalUrl.startsWith('http') ? originalUrl : baseUrl + originalUrl;
+        const encodedUrl = Buffer.from(fullUrl).toString('base64url');
+        return `${BASE_URL}/proxy/stream?url=${encodedUrl}&ref=${ref || ''}`;
+    };
+
+    return content.split('\n').map(line => {
+        const trimmed = line.trim();
+
+        // Handle URI= in comments (audio/subtitle tracks, encryption keys)
+        if (trimmed.includes('URI="')) {
+            return trimmed.replace(/URI="([^"]+)"/g, (match, uri) => {
+                return `URI="${proxyUrl(uri)}"`;
+            });
+        }
+
+        // Skip other comments and empty lines
+        if (trimmed.startsWith('#') || trimmed === '') {
+            return line;
+        }
+
+        // Rewrite segment/playlist URLs
+        return proxyUrl(trimmed);
+    }).join('\n');
+}
+
+/**
  * M3U8 Proxy Endpoint - Fetches m3u8 with proper Referer header
  * Rewrites all URLs to go through our proxy for full TV compatibility
- * 
+ *
  * Query params:
- * - url: Base64-encoded m3u8 URL
- * - ref: Base64-encoded Referer URL
+ * - url: Base64url-encoded m3u8 URL
+ * - ref: Base64url-encoded Referer URL
  */
 app.get('/proxy/m3u8', async (req, res) => {
     try {
@@ -166,7 +277,7 @@ app.get('/proxy/m3u8', async (req, res) => {
             return res.status(400).send('Missing url parameter');
         }
 
-        // Decode base64 parameters
+        // Decode base64 parameters (Node accepts both base64 and base64url alphabets)
         const videoUrl = Buffer.from(url, 'base64').toString('utf-8');
         const referer = ref ? Buffer.from(ref, 'base64').toString('utf-8') : '';
 
@@ -177,11 +288,8 @@ app.get('/proxy/m3u8', async (req, res) => {
 
         // Fetch m3u8 with Referer header
         const response = await fetch(videoUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Referer': referer,
-                'Origin': referer ? new URL(referer).origin : ''
-            }
+            headers: upstreamHeaders(referer),
+            signal: AbortSignal.timeout(15000)
         });
 
         if (!response.ok) {
@@ -189,34 +297,8 @@ app.get('/proxy/m3u8', async (req, res) => {
             return res.status(response.status).send('Failed to fetch m3u8');
         }
 
-        let content = await response.text();
-
-        // Helper to create proxied URL
-        const proxyUrl = (originalUrl) => {
-            const fullUrl = originalUrl.startsWith('http') ? originalUrl : baseUrl + originalUrl;
-            const encodedUrl = Buffer.from(fullUrl).toString('base64');
-            return `${BASE_URL}/proxy/stream?url=${encodedUrl}&ref=${ref}`;
-        };
-
         // Rewrite ALL URLs to go through our proxy
-        content = content.split('\n').map(line => {
-            const trimmed = line.trim();
-
-            // Handle URI= in comments (audio/subtitle tracks)
-            if (trimmed.includes('URI="')) {
-                return trimmed.replace(/URI="([^"]+)"/g, (match, uri) => {
-                    return `URI="${proxyUrl(uri)}"`;
-                });
-            }
-
-            // Skip other comments and empty lines
-            if (trimmed.startsWith('#') || trimmed === '') {
-                return line;
-            }
-
-            // Rewrite segment/playlist URLs
-            return proxyUrl(trimmed);
-        }).join('\n');
+        const content = rewritePlaylist(await response.text(), baseUrl, ref);
 
         // Return m3u8 content with proper headers
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
@@ -227,7 +309,9 @@ app.get('/proxy/m3u8', async (req, res) => {
 
     } catch (error) {
         log.error(`Proxy m3u8 error: ${error.message}`);
-        res.status(500).send('Proxy error');
+        if (!res.headersSent) {
+            res.status(500).send('Proxy error');
+        }
     }
 });
 
@@ -243,7 +327,7 @@ app.get('/proxy/stream', async (req, res) => {
             return res.status(400).send('Missing url parameter');
         }
 
-        // Decode base64 parameters
+        // Decode base64 parameters (Node accepts both base64 and base64url alphabets)
         const streamUrl = Buffer.from(url, 'base64').toString('utf-8');
         const referer = ref ? Buffer.from(ref, 'base64').toString('utf-8') : '';
 
@@ -252,11 +336,7 @@ app.get('/proxy/stream', async (req, res) => {
 
         // Fetch stream with Referer header
         const response = await fetch(streamUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Referer': referer,
-                'Origin': referer ? new URL(referer).origin : ''
-            }
+            headers: upstreamHeaders(referer)
         });
 
         if (!response.ok) {
@@ -266,63 +346,40 @@ app.get('/proxy/stream', async (req, res) => {
 
         // Check if this is an m3u8 playlist (needs URL rewriting)
         const contentType = response.headers.get('content-type') || '';
-        const isM3u8 = streamUrl.endsWith('.m3u8') || streamUrl.endsWith('.txt') ||
+        const urlPath = streamUrl.split('?')[0];
+        const isM3u8 = urlPath.endsWith('.m3u8') || urlPath.endsWith('.txt') ||
             contentType.includes('mpegurl') || contentType.includes('m3u8');
 
         if (isM3u8) {
-            let content = await response.text();
-
-            // Helper to create proxied URL
-            const proxyUrl = (originalUrl) => {
-                const fullUrl = originalUrl.startsWith('http') ? originalUrl : baseUrl + originalUrl;
-                const encodedUrl = Buffer.from(fullUrl).toString('base64');
-                return `${BASE_URL}/proxy/stream?url=${encodedUrl}&ref=${ref}`;
-            };
-
-            // Rewrite URLs in the playlist
-            content = content.split('\n').map(line => {
-                const trimmed = line.trim();
-
-                // Handle URI= in comments
-                if (trimmed.includes('URI="')) {
-                    return trimmed.replace(/URI="([^"]+)"/g, (match, uri) => {
-                        return `URI="${proxyUrl(uri)}"`;
-                    });
-                }
-
-                // Skip other comments and empty lines
-                if (trimmed.startsWith('#') || trimmed === '') {
-                    return line;
-                }
-
-                // Rewrite segment URLs
-                return proxyUrl(trimmed);
-            }).join('\n');
+            const content = rewritePlaylist(await response.text(), baseUrl, ref);
 
             res.set('Content-Type', 'application/vnd.apple.mpegurl');
             res.set('Cache-Control', 'no-cache');
             res.send(content);
         } else {
-            // Binary content (video/audio segments) - pipe directly
+            // Binary content (video/audio segments) - pipe with backpressure handling
             res.set('Content-Type', contentType || 'video/mp2t');
+            const contentLength = response.headers.get('content-length');
+            if (contentLength) res.set('Content-Length', contentLength);
             res.set('Cache-Control', 'max-age=3600');
 
-            // Pipe the response body
-            const reader = response.body.getReader();
-            const pump = async () => {
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    res.write(value);
-                }
-                res.end();
-            };
-            await pump();
+            // pipeline handles backpressure and tears down the upstream
+            // fetch if the client disconnects mid-segment
+            await pipeline(Readable.fromWeb(response.body), res);
         }
 
     } catch (error) {
-        log.error(`Proxy stream error: ${error.message}`);
-        res.status(500).send('Proxy error');
+        // Client disconnects mid-segment are routine for video players — log quietly
+        if (error.code === 'ERR_STREAM_PREMATURE_CLOSE') {
+            log.debug('Proxy stream closed by client');
+        } else {
+            log.error(`Proxy stream error: ${error.message}`);
+        }
+        if (!res.headersSent) {
+            res.status(500).send('Proxy error');
+        } else {
+            res.destroy();
+        }
     }
 });
 

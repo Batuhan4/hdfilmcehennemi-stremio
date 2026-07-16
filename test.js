@@ -6,6 +6,7 @@
 
 const { getVideoAndSubtitles, toStremioStreams } = require('./scraper');
 const { findContent, searchOnSite, isValidImdbId } = require('./search');
+const { SITE_BASE_URL } = require('./config');
 const { createLogger } = require('./logger');
 const { ContentNotFoundError, ScrapingError, ValidationError } = require('./errors');
 
@@ -19,11 +20,12 @@ async function testScraping() {
     log.info('Testing Scraper');
     log.info('='.repeat(60));
 
-    const testUrl = 'https://www.hdfilmcehennemi.ws/wake-up-dead-man-a-knives-out-mystery/';
+    // Override with TEST_URL env var if this slug rotates off the site
+    const testUrl = process.env.TEST_URL || `${SITE_BASE_URL}/1-avatar-hd-film-izle-510/`;
     log.info(`Test URL: ${testUrl}`);
 
     try {
-        const result = await getVideoAndSubtitles(testUrl);
+        const result = await getVideoAndSubtitles(testUrl, { fetchAudioTracks: true });
 
         log.info('✅ Scraping successful!');
 
@@ -51,7 +53,7 @@ async function testScraping() {
         log.info(`🔄 Alternative Sources: ${result.alternativeSources.length}`);
 
         // Stremio format
-        const stremioFormat = toStremioStreams(result, 'Wake Up Dead Man');
+        const stremioFormat = toStremioStreams(result, 'Test Movie');
         log.info(`📦 Stremio Streams: ${stremioFormat.streams.length}`);
 
         return true;

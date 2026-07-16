@@ -11,11 +11,12 @@ const cheerio = require('cheerio');
 const { createLogger } = require('./logger');
 const { ScrapingError, NetworkError, TimeoutError } = require('./errors');
 const { getWorkingProxy, markProxyBad, createProxyAgent, isProxyEnabled, isProxyAlways } = require('./proxy');
+const { SITE_BASE_URL, EMBED_BASE_URL, isHdfilmcehennemiUrl } = require('./config');
 
 const log = createLogger('Scraper');
 
-const BASE_URL = 'https://www.hdfilmcehennemi.ws';
-const EMBED_BASE = 'https://hdfilmcehennemi.mobi';
+const BASE_URL = SITE_BASE_URL;
+const EMBED_BASE = EMBED_BASE_URL;
 
 // Configuration
 const CONFIG = {
@@ -70,15 +71,6 @@ function releaseSlot() {
  */
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/**
- * Check if URL is an HDFilmCehennemi domain (needs proxy)
- * @param {string} url - URL to check
- * @returns {boolean}
- */
-function isHdfilmcehennemiUrl(url) {
-    return url.includes('hdfilmcehennemi.ws') || url.includes('hdfilmcehennemi.mobi');
 }
 
 /**
@@ -191,6 +183,7 @@ async function httpGet(url, referer = null) {
                     // Check for Cloudflare block (403)
                     if (response.status === 403 && isHdfilmcehennemiUrl(url)) {
                         log.warn(`Cloudflare block detected (403), will try proxy...`);
+                        lastError = new NetworkError('Cloudflare block (403)', url, 403);
                         useProxy = true;
                         break;
                     }
@@ -206,11 +199,13 @@ async function httpGet(url, referer = null) {
                     const text = await response.text();
 
                     // Check for Cloudflare challenge page
+                    // NOTE: do not match 'challenge-platform' — Cloudflare injects
+                    // /cdn-cgi/challenge-platform/... scripts into normal 200 pages too
                     if (isHdfilmcehennemiUrl(url) &&
                         (text.includes('cf-browser-verification') ||
-                            text.includes('Just a moment') ||
-                            text.includes('challenge-platform'))) {
+                            text.includes('Just a moment'))) {
                         log.warn(`Cloudflare challenge detected, will try proxy...`);
+                        lastError = new NetworkError('Cloudflare challenge page', url, 403);
                         useProxy = true;
                         break;
                     }
@@ -408,9 +403,9 @@ function isValidVideoUrl(url) {
  *   - Variant 3: join → base64 → reverse → ROT13 → unmix (NEW Dec 2025)
  * 
  * This function tries all variants and returns the one that produces a valid URL.
- * 
+ *
  * @param {string[]} parts - Array of encoded parts
- * @returns {string} Decoded video URL
+ * @returns {string|null} Decoded video URL, or null if no variant produced a valid URL
  */
 function decodeVideoUrl(parts) {
     const value = parts.join('');
@@ -451,26 +446,21 @@ function decodeVideoUrl(parts) {
         log.debug(`Variant 2 failed: ${e.message}`);
     }
 
-    // If none produced a valid URL, try Variant 3 and return (for debugging)
-    log.warn('No algorithm variant produced a valid URL, returning Variant 3 result');
-    try {
-        return decodeVariant3(value);
-    } catch (e) {
-        try {
-            return decodeVariant1(reversed);
-        } catch (e2) {
-            return decodeVariant2(reversed);
-        }
-    }
+    // No variant produced a valid URL. Return null so callers can fall back
+    // to alternative sources instead of handing the player a garbage URL.
+    log.warn('No algorithm variant produced a valid video URL (site encryption may have rotated)');
+    return null;
 }
 
 /**
  * Scrape video and subtitle data from iframe URL
  * @param {string} iframeSrc - Iframe source URL
+ * @param {boolean} [fetchAudioTracks=false] - Fetch the m3u8 to enumerate audio tracks
+ *   (extra round trip; only useful for diagnostics — the player reads tracks from the m3u8 itself)
  * @returns {Promise<{videoUrl: string|null, subtitles: Array, audioTracks: Array}>}
  * @throws {ScrapingError|NetworkError}
  */
-async function scrapeIframe(iframeSrc) {
+async function scrapeIframe(iframeSrc, fetchAudioTracks = false) {
     log.debug(`Scraping iframe: ${iframeSrc}`);
 
     const html = await httpGet(iframeSrc, BASE_URL);
@@ -512,10 +502,13 @@ async function scrapeIframe(iframeSrc) {
 
         // Decode video URL from parts array
         const partsMatch = decoded.match(/dc_\w+\(\[([^\]]+)\]\)/);
-        if (partsMatch) {
-            const parts = partsMatch[1].match(/"([^"]+)"/g).map(s => s.replace(/"/g, ''));
+        const quotedParts = partsMatch && partsMatch[1].match(/"([^"]+)"/g);
+        if (quotedParts) {
+            const parts = quotedParts.map(s => s.replace(/"/g, ''));
             result.videoUrl = decodeVideoUrl(parts);
-            log.debug(`Video URL extracted from packed JS: ${result.videoUrl.substring(0, 80)}...`);
+            if (result.videoUrl) {
+                log.debug(`Video URL extracted from packed JS: ${result.videoUrl.substring(0, 80)}...`);
+            }
         }
     } else {
         log.debug('No packed JavaScript found in iframe');
@@ -537,8 +530,8 @@ async function scrapeIframe(iframeSrc) {
         }
     }
 
-    // Extract audio tracks from m3u8
-    if (result.videoUrl) {
+    // Extract audio tracks from m3u8 (opt-in — costs an extra request on the hot path)
+    if (result.videoUrl && fetchAudioTracks) {
         try {
             const m3u8Content = await httpGet(result.videoUrl, iframeSrc);
             const baseM3u8 = result.videoUrl.substring(0, result.videoUrl.lastIndexOf('/'));
@@ -570,10 +563,13 @@ async function scrapeIframe(iframeSrc) {
  * Implements fallback logic for alternative sources
  * 
  * @param {string} pageUrl - HDFilmCehennemi page URL
+ * @param {Object} [options] - Options
+ * @param {boolean} [options.fetchAudioTracks=false] - Fetch the m3u8 to enumerate audio tracks (diagnostic only)
  * @returns {Promise<{videoUrl: string, subtitles: Array, audioTracks: Array, source?: string, alternativeSources: Array}|null>}
  * @throws {ScrapingError|NetworkError}
  */
-async function getVideoAndSubtitles(pageUrl) {
+async function getVideoAndSubtitles(pageUrl, options = {}) {
+    const { fetchAudioTracks = false } = options;
     log.info(`Fetching video from: ${pageUrl}`);
 
     const html = await httpGet(pageUrl);
@@ -618,7 +614,7 @@ async function getVideoAndSubtitles(pageUrl) {
     // Try active source
     let result = null;
     try {
-        result = await scrapeIframe(iframeSrc);
+        result = await scrapeIframe(iframeSrc, fetchAudioTracks);
     } catch (error) {
         log.warn(`Primary source failed: ${error.message}`);
     }
@@ -644,7 +640,7 @@ async function getVideoAndSubtitles(pageUrl) {
                 }
 
                 try {
-                    const altResult = await scrapeIframe(altIframeSrc);
+                    const altResult = await scrapeIframe(altIframeSrc, fetchAudioTracks);
                     if (altResult && altResult.videoUrl) {
                         result = altResult;
                         result.source = alt.name;
@@ -690,8 +686,8 @@ function toStremioStreams(result, title = 'HDFilmCehennemi', baseUrl = null) {
     if (!result || !result.videoUrl) return { streams: [] };
 
     // Use the embed origin from scraping result, fallback to EMBED_BASE
-    // Critical: Rapidrame videos need hdfilmcehennemi.ws as Referer
-    //           Close videos need hdfilmcehennemi.mobi as Referer
+    // Critical: Rapidrame videos need the main site domain as Referer
+    //           Close videos need the embed host as Referer
     const embedOrigin = result.embedOrigin || EMBED_BASE;
     const referer = embedOrigin + '/';
 
@@ -699,8 +695,9 @@ function toStremioStreams(result, title = 'HDFilmCehennemi', baseUrl = null) {
     // PC clients can still use behaviorHints.proxyHeaders
     let streamUrl = result.videoUrl;
     if (baseUrl) {
-        const encodedUrl = Buffer.from(result.videoUrl).toString('base64');
-        const encodedRef = Buffer.from(referer).toString('base64');
+        // base64url: '+' in plain base64 becomes a space in query strings and corrupts the URL
+        const encodedUrl = Buffer.from(result.videoUrl).toString('base64url');
+        const encodedRef = Buffer.from(referer).toString('base64url');
         streamUrl = `${baseUrl}/proxy/m3u8?url=${encodedUrl}&ref=${encodedRef}`;
     }
 

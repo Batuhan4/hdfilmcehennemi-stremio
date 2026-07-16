@@ -11,6 +11,7 @@
 const { fetch, ProxyAgent } = require('undici');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 const { createLogger } = require('./logger');
+const { SITE_BASE_URL, PROXY_MODE } = require('./config');
 
 const log = createLogger('Proxy');
 
@@ -41,11 +42,11 @@ const PROXY_SOURCES = [...HTTP_SOURCES, ...SOCKS4_SOURCES, ...SOCKS5_SOURCES];
 
 // Configuration
 const CONFIG = {
-    proxyEnabled: process.env.PROXY_ENABLED || 'auto', // 'auto' | 'always' | 'never'
+    proxyEnabled: PROXY_MODE, // 'never' (default) | 'auto' | 'always'
     cacheTTL: 10 * 60 * 1000, // 10 minutes
     testTimeout: 8000, // 8 seconds for proxy test
     maxProxiesToTest: 100, // Test all available proxies for fastest discovery
-    testUrl: 'https://www.hdfilmcehennemi.ws/' // URL to test proxies against
+    testUrl: `${SITE_BASE_URL}/` // URL to test proxies against
 };
 
 // Proxy list cache - now stores objects with type info

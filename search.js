@@ -11,10 +11,11 @@ const cheerio = require('cheerio');
 const { createLogger } = require('./logger');
 const { ContentNotFoundError, NetworkError, ValidationError, TimeoutError } = require('./errors');
 const { getWorkingProxy, markProxyBad, createProxyAgent, isProxyEnabled, isProxyAlways } = require('./proxy');
+const { SITE_BASE_URL, isHdfilmcehennemiUrl } = require('./config');
 
 const log = createLogger('Search');
 
-const BASE_URL = 'https://www.hdfilmcehennemi.ws';
+const BASE_URL = SITE_BASE_URL;
 
 // Configuration
 const CONFIG = {
@@ -39,15 +40,6 @@ const defaultHeaders = {
  */
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/**
- * Check if URL is an HDFilmCehennemi domain (needs proxy)
- * @param {string} url - URL to check
- * @returns {boolean}
- */
-function isHdfilmcehennemiUrl(url) {
-    return url.includes('hdfilmcehennemi.ws') || url.includes('hdfilmcehennemi.mobi');
 }
 
 /**
@@ -163,6 +155,7 @@ async function fetchWithRetry(url, options = {}) {
                     // Check for Cloudflare block (403)
                     if (response.status === 403 && isHdfilmcehennemiUrl(url)) {
                         log.warn(`Cloudflare block detected (403), will try proxy...`);
+                        lastError = new NetworkError('Cloudflare block (403)', url, 403);
                         useProxy = true;
                         break;
                     }

@@ -1,10 +1,21 @@
-# bu proje artık maintain edilmeyecektir
-
 # HDFilmCehennemi Stremio Addon
 
 HDFilmCehennemi içeriklerini Stremio üzerinden izlemenizi sağlayan bir addon.
 
-maintain hakkında: hdfilmcehennemi 1 haftalık gözlemime göre her gün bazende günde 2 defa şifreleme algoritmasını değiştiriyor. Bunu çözmek için kodu güncelledim fakat farklı bir adım eklerse tekrardan güncellemek gerekecek. Kısacası kullanmadan önce 'node test' yazarsanız eğer orda şifrelenmiş bir şey yok ise sıkıntı yok demektir fakat var ise de issue açabilirsiniz çözmeye çalışırım, bu aralar çok fazla film/dizi izleyemiyorum her gün bakamıyorum maalesef.[Şu anki şifreleme](https://github.com/enXov/hdfilmcehennemi-stremio/blob/main/scraper.js#L390)
+> **Not:** Bu depo, [enXov/hdfilmcehennemi-stremio](https://github.com/enXov/hdfilmcehennemi-stremio) projesinin sürdürülen (maintained) bir fork'udur. Orijinal proje bakım almıyordu; bu fork'ta güncel domain, yapılandırılabilir alan adı, varsayılan olarak kapalı proxy ve bir dizi hata/performans düzeltmesi yapıldı. Ev ağında (LAN) yerel kullanım için tasarlandı — internete açılmaz.
+
+## 🚀 Bu fork'taki değişiklikler
+
+- **Güncel domain:** `.ws` → `.nl` geçişi yapıldı. Alan adı artık `SITE_DOMAIN` / `EMBED_DOMAIN` ortam değişkenleriyle yapılandırılıyor (`config.js`) — site domain değiştirdiğinde kodu düzenlemeye gerek yok, tek satır ayar.
+- **Proxy varsayılan olarak kapalı** (`PROXY_ENABLED=never`): proxy katmanı yalnızca Türkiye **dışından** Cloudflare engelini aşmak içindir. Türkiye'de doğrudan erişim olduğu için gerek yok; kod korundu ama kapalı geliyor.
+- **Hata düzeltmeleri:**
+  - Cloudflare "challenge" yanlış-pozitif tespiti düzeltildi — proxy kapalıyken normal sayfalardaki `challenge-platform` scriptleri yüzünden **her scrape başarısız oluyordu**.
+  - Proxy URL kodlaması `base64url`'e çevrildi (uzun m3u8 URL'lerindeki `+` karakterinin sorgu dizesinde bozulması).
+  - Video akışında backpressure düzeltmesi (`stream.pipeline`) — hızlı kaynak + yavaş istemcide bellek şişmesi önlendi.
+  - Çeşitli null-güvenliği, timeout ve çift-gönderim (double-send) düzeltmeleri.
+- **Performans:** başarılı sonuçlar için TTL'li bellek içi cache (tekrar isteklerde ~700 ms → ~3 ms); her istekte yapılan gereksiz ses-parçası (audio track) çekme işlemi opsiyonel hâle getirildi.
+
+> **Durum:** HDFilmCehennemi embed/şifreleme formatını sık sık değiştiriyor; video çıkarma (extraction) mantığı bu fork'ta aktif olarak güncel tutulmaktadır. Kullanmadan önce `npm test` ile doğrulayabilirsiniz.
 
 ## Özellikler
 
@@ -71,7 +82,9 @@ Addon varsayılan olarak `http://localhost:7000` adresinde çalışır.
 | `PORT` | 7000 | Sunucu portu |
 | `BASE_URL` | http://localhost:7000 | Addon sunucusunun public URL'i (TV oynatımı için gerekli) |
 | `LOG_LEVEL` | info | Log seviyesi (debug, info, warn, error) |
-| `PROXY_ENABLED` | auto | Proxy modu: `auto` (gerektiğinde), `always` (her zaman), `never` (kapalı) |
+| `SITE_DOMAIN` | hdfilmcehennemi.nl | Ana site alan adı (site alan adı değiştirdiğinde güncelleyin) |
+| `EMBED_DOMAIN` | hdfilmcehennemi.mobi | Video oynatıcı (embed) alan adı |
+| `PROXY_ENABLED` | never | Proxy modu: `never` (kapalı — Türkiye'den doğrudan erişim), `auto` (Cloudflare engellerse), `always` (her zaman) |
 
 ### Örnek .env
 
@@ -79,7 +92,8 @@ Addon varsayılan olarak `http://localhost:7000` adresinde çalışır.
 PORT=7000
 BASE_URL=http://localhost:7000
 LOG_LEVEL=info
-PROXY_ENABLED=auto
+SITE_DOMAIN=hdfilmcehennemi.nl
+PROXY_ENABLED=never
 ```
 
 Örnek kullanım:
@@ -100,9 +114,11 @@ npm test
 ## 📁 Proje Yapısı
 
 ```
-├── addon.js      # Stremio addon sunucusu
+├── addon.js      # Stremio addon sunucusu + m3u8 proxy
+├── config.js     # Alan adı / proxy yapılandırması (SITE_DOMAIN, EMBED_DOMAIN, PROXY_ENABLED)
 ├── scraper.js    # Video/altyazı çekme modülü
 ├── search.js     # İçerik arama ve eşleştirme
+├── proxy.js      # Proxy list yönetimi (varsayılan kapalı)
 ├── logger.js     # Log sistemi
 ├── errors.js     # Hata sınıfları
 ├── test.js       # Test scripti
