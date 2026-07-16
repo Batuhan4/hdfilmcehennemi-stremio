@@ -384,6 +384,98 @@ function decodeVariant3(value) {
 }
 
 /**
+ * Parse the site's inline `dc_xxx` decoder function into an ordered list of
+ * decode steps, plus the encoded parts array it is called with.
+ *
+ * As of mid-2026 the embed page no longer hides the decoder inside the packed
+ * eval block — it emits a plain inline script like:
+ *
+ *   function dc_XXXX(value_parts) {
+ *     let value = value_parts.join('');
+ *     result = atob(result);                  // base64 decode
+ *     result = result.split('').reverse()...  // reverse
+ *     result = result.replace(/[a-zA-Z]/g, (o - base + 16) % 26 + base) // ROT-N
+ *     charCode = ((charCode - (1372195828 % (i + 12))) % 256 + 256) % 256 // unmix
+ *   }
+ *   var s_YYYY = dc_XXXX(["...", "...", ...]);
+ *
+ * The step order, ROT shift and unmix magic/offset rotate per page, so instead
+ * of hardcoding variants we parse the emitted function and interpret its steps.
+ *
+ * @param {string} html - Raw iframe HTML
+ * @returns {{steps: Array<Object>, parts: string[]}|null} Parsed decoder, or null if not present
+ */
+function parseInlineDecoder(html) {
+    const fnMatch = html.match(/function\s+(dc_\w+)\s*\(\s*[\w$]+\s*\)\s*\{([\s\S]*?)\n\}/);
+    if (!fnMatch) return null;
+    const [, fnName, body] = fnMatch;
+
+    // The call site: var s_xxx = dc_XXXX(["part1", "part2", ...]);
+    const callMatch = html.match(new RegExp(fnName + '\\(\\[([^\\]]+)\\]\\)'));
+    if (!callMatch) return null;
+    const quotedParts = callMatch[1].match(/"([^"]+)"/g);
+    if (!quotedParts) return null;
+    const parts = quotedParts.map(s => s.slice(1, -1));
+
+    // Scan the function body in statement order for known decode primitives
+    const steps = [];
+    const stepRe = /=\s*atob\(\s*result\s*\)|result\.split\(''\)\.reverse\(\)\.join\(''\)|\(o\s*-\s*base\s*\+\s*(\d+)\)\s*%\s*26|charCode\s*-\s*\((\d+)\s*%\s*\(i\s*\+\s*(\d+)\)\)/g;
+    let m;
+    while ((m = stepRe.exec(body)) !== null) {
+        if (m[0].includes('atob')) {
+            steps.push({ op: 'base64' });
+        } else if (m[0].includes('reverse')) {
+            steps.push({ op: 'reverse' });
+        } else if (m[1] !== undefined) {
+            steps.push({ op: 'rot', shift: parseInt(m[1], 10) });
+        } else {
+            steps.push({ op: 'unmix', magic: parseInt(m[2], 10), offset: parseInt(m[3], 10) });
+        }
+    }
+
+    if (steps.length === 0) return null;
+    return { steps, parts };
+}
+
+/**
+ * Apply a parsed decode-step chain to the joined parts string.
+ * @param {string[]} parts - Encoded parts array
+ * @param {Array<Object>} steps - Steps from parseInlineDecoder
+ * @returns {string} Decoded string (candidate video URL)
+ */
+function applyDecodeSteps(parts, steps) {
+    let result = parts.join('');
+    for (const step of steps) {
+        switch (step.op) {
+            case 'base64':
+                result = Buffer.from(result, 'base64').toString('latin1');
+                break;
+            case 'reverse':
+                result = result.split('').reverse().join('');
+                break;
+            case 'rot':
+                result = result.replace(/[a-zA-Z]/g, (c) => {
+                    const o = c.charCodeAt(0);
+                    const base = o <= 90 ? 65 : 97;
+                    return String.fromCharCode((o - base + step.shift) % 26 + base);
+                });
+                break;
+            case 'unmix': {
+                let unmix = '';
+                for (let i = 0; i < result.length; i++) {
+                    let charCode = result.charCodeAt(i);
+                    charCode = ((charCode - (step.magic % (i + step.offset))) % 256 + 256) % 256;
+                    unmix += String.fromCharCode(charCode);
+                }
+                result = unmix;
+                break;
+            }
+        }
+    }
+    return result;
+}
+
+/**
  * Validate if a decoded string is a valid video URL
  * @param {string} url - Decoded URL candidate
  * @returns {boolean} True if it looks like a valid video URL
@@ -489,8 +581,30 @@ async function scrapeIframe(iframeSrc, fetchAudioTracks = false) {
 
     log.debug(`Found ${result.subtitles.length} subtitles`);
 
-    // Method 1: Try packed JavaScript decoder (primary method)
-    const packedMatch = html.match(/eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.+)',(\d+),(\d+),'([^']+)'/s);
+    // Method 1: Inline dc_xxx decoder (current format as of mid-2026).
+    // The embed page emits the decoder function and its encoded parts array in
+    // plain sight; we parse the step chain and interpret it rather than relying
+    // on a fixed variant order (steps/ROT shift/unmix magic rotate per page).
+    const inline = parseInlineDecoder(html);
+    if (inline) {
+        try {
+            const decoded = applyDecodeSteps(inline.parts, inline.steps);
+            if (isValidVideoUrl(decoded)) {
+                result.videoUrl = decoded;
+                log.debug(`Video URL extracted from inline decoder: ${decoded.substring(0, 80)}...`);
+            } else {
+                log.debug('Inline decoder produced a non-URL result, falling back');
+            }
+        } catch (e) {
+            log.debug(`Inline decoder failed: ${e.message}`);
+        }
+    } else {
+        log.debug('No inline dc_ decoder found in iframe');
+    }
+
+    // Method 2: Try packed JavaScript decoder (legacy format, retained as fallback)
+    const packedMatch = !result.videoUrl &&
+        html.match(/eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.+)',(\d+),(\d+),'([^']+)'/s);
 
     if (packedMatch) {
         const decoded = unpackJS(
@@ -514,7 +628,9 @@ async function scrapeIframe(iframeSrc, fetchAudioTracks = false) {
         log.debug('No packed JavaScript found in iframe');
     }
 
-    // Method 2: Fallback to JSON-LD schema (if packed JS failed)
+    // Method 3: Fallback to JSON-LD schema (if inline + packed JS both failed).
+    // NOTE: the JSON-LD contentUrl on this site is frequently a stale/expired
+    // CDN link (e.g. playmix.uno/master.txt that 404s); it is a last resort only.
     if (!result.videoUrl) {
         const jsonLdMatch = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/);
         if (jsonLdMatch) {
