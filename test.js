@@ -8,7 +8,7 @@ const { getVideoAndSubtitles, toStremioStreams } = require('./scraper');
 const { findContent, searchOnSite, isValidImdbId } = require('./search');
 const { SITE_BASE_URL } = require('./config');
 const { createLogger } = require('./logger');
-const { ContentNotFoundError, ScrapingError, ValidationError } = require('./errors');
+const { ContentNotFoundError, ValidationError } = require('./errors');
 
 const log = createLogger('Test');
 

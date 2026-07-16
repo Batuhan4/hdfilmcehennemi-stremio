@@ -359,13 +359,19 @@ async function findEpisodeUrl(seriesUrl, season, episode) {
         ep.season === parseInt(season) && ep.episode === parseInt(episode)
     );
 
-    if (targetEpisode) {
-        log.debug(`Found episode: S${season}E${episode} -> ${targetEpisode.url}`);
-    } else {
+    if (!targetEpisode) {
         log.warn(`Episode not found: S${season}E${episode}`);
+        return null;
     }
 
-    return targetEpisode?.url || null;
+    // Episode hrefs may be relative — resolve against the series page URL
+    let episodeUrl = targetEpisode.url;
+    try {
+        episodeUrl = new URL(targetEpisode.url, seriesUrl).href;
+    } catch { /* keep as-is if unresolvable */ }
+
+    log.debug(`Found episode: S${season}E${episode} -> ${episodeUrl}`);
+    return episodeUrl;
 }
 
 /**

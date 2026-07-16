@@ -229,14 +229,21 @@ function upstreamHeaders(referer) {
  * Rewrite all URLs in an m3u8 playlist to go through our /proxy/stream endpoint
  * Handles segment lines, nested playlists, and URI="..." attributes (audio/subtitle tracks)
  * @param {string} content - Raw m3u8 content
- * @param {string} baseUrl - Base URL for resolving relative paths (with trailing slash)
+ * @param {string} playlistUrl - Full URL of the playlist being rewritten (for resolving relative paths)
  * @param {string} ref - Already-encoded ref query parameter to propagate
  * @returns {string} Rewritten playlist
  */
-function rewritePlaylist(content, baseUrl, ref) {
+function rewritePlaylist(content, playlistUrl, ref) {
     // base64url: safe in query strings ('+' in plain base64 decodes as a space)
     const proxyUrl = (originalUrl) => {
-        const fullUrl = originalUrl.startsWith('http') ? originalUrl : baseUrl + originalUrl;
+        // new URL() correctly resolves absolute, root-relative (/hls/...) and
+        // path-relative references, and is immune to query strings in the base
+        let fullUrl;
+        try {
+            fullUrl = new URL(originalUrl, playlistUrl).href;
+        } catch {
+            return originalUrl; // unresolvable — leave the line untouched
+        }
         const encodedUrl = Buffer.from(fullUrl).toString('base64url');
         return `${BASE_URL}/proxy/stream?url=${encodedUrl}&ref=${ref || ''}`;
     };
@@ -283,9 +290,6 @@ app.get('/proxy/m3u8', async (req, res) => {
 
         log.debug(`Proxy m3u8: ${videoUrl.substring(0, 80)}...`);
 
-        // Get base URL for resolving relative paths
-        const baseUrl = videoUrl.substring(0, videoUrl.lastIndexOf('/') + 1);
-
         // Fetch m3u8 with Referer header
         const response = await fetch(videoUrl, {
             headers: upstreamHeaders(referer),
@@ -298,7 +302,7 @@ app.get('/proxy/m3u8', async (req, res) => {
         }
 
         // Rewrite ALL URLs to go through our proxy
-        const content = rewritePlaylist(await response.text(), baseUrl, ref);
+        const content = rewritePlaylist(await response.text(), videoUrl, ref);
 
         // Return m3u8 content with proper headers
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
@@ -331,9 +335,6 @@ app.get('/proxy/stream', async (req, res) => {
         const streamUrl = Buffer.from(url, 'base64').toString('utf-8');
         const referer = ref ? Buffer.from(ref, 'base64').toString('utf-8') : '';
 
-        // Get base URL for this stream (for nested m3u8 files)
-        const baseUrl = streamUrl.substring(0, streamUrl.lastIndexOf('/') + 1);
-
         // Fetch stream with Referer header
         const response = await fetch(streamUrl, {
             headers: upstreamHeaders(referer)
@@ -351,7 +352,7 @@ app.get('/proxy/stream', async (req, res) => {
             contentType.includes('mpegurl') || contentType.includes('m3u8');
 
         if (isM3u8) {
-            const content = rewritePlaylist(await response.text(), baseUrl, ref);
+            const content = rewritePlaylist(await response.text(), streamUrl, ref);
 
             res.set('Content-Type', 'application/vnd.apple.mpegurl');
             res.set('Cache-Control', 'no-cache');

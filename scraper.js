@@ -401,40 +401,49 @@ function decodeVariant3(value) {
  *
  * The step order, ROT shift and unmix magic/offset rotate per page, so instead
  * of hardcoding variants we parse the emitted function and interpret its steps.
+ * A page may carry more than one dc_ function (e.g. multiple players); every
+ * decoder that has a matching call site is returned so the caller can try each.
  *
  * @param {string} html - Raw iframe HTML
- * @returns {{steps: Array<Object>, parts: string[]}|null} Parsed decoder, or null if not present
+ * @returns {Array<{steps: Array<Object>, parts: string[]}>} Parsed decoders (empty if none present)
  */
 function parseInlineDecoder(html) {
-    const fnMatch = html.match(/function\s+(dc_\w+)\s*\(\s*[\w$]+\s*\)\s*\{([\s\S]*?)\n\}/);
-    if (!fnMatch) return null;
-    const [, fnName, body] = fnMatch;
+    const decoders = [];
+    const fnRe = /function\s+(dc_\w+)\s*\(\s*[\w$]+\s*\)\s*\{([\s\S]*?)\n\}/g;
+    let fnMatch;
 
-    // The call site: var s_xxx = dc_XXXX(["part1", "part2", ...]);
-    const callMatch = html.match(new RegExp(fnName + '\\(\\[([^\\]]+)\\]\\)'));
-    if (!callMatch) return null;
-    const quotedParts = callMatch[1].match(/"([^"]+)"/g);
-    if (!quotedParts) return null;
-    const parts = quotedParts.map(s => s.slice(1, -1));
+    while ((fnMatch = fnRe.exec(html)) !== null) {
+        const [, fnName, body] = fnMatch;
 
-    // Scan the function body in statement order for known decode primitives
-    const steps = [];
-    const stepRe = /=\s*atob\(\s*result\s*\)|result\.split\(''\)\.reverse\(\)\.join\(''\)|\(o\s*-\s*base\s*\+\s*(\d+)\)\s*%\s*26|charCode\s*-\s*\((\d+)\s*%\s*\(i\s*\+\s*(\d+)\)\)/g;
-    let m;
-    while ((m = stepRe.exec(body)) !== null) {
-        if (m[0].includes('atob')) {
-            steps.push({ op: 'base64' });
-        } else if (m[0].includes('reverse')) {
-            steps.push({ op: 'reverse' });
-        } else if (m[1] !== undefined) {
-            steps.push({ op: 'rot', shift: parseInt(m[1], 10) });
-        } else {
-            steps.push({ op: 'unmix', magic: parseInt(m[2], 10), offset: parseInt(m[3], 10) });
+        // The call site: var s_xxx = dc_XXXX(["part1", "part2", ...]);
+        const callMatch = html.match(new RegExp(fnName + '\\(\\s*\\[([^\\]]+)\\]\\s*\\)'));
+        if (!callMatch) continue;
+        const quotedParts = callMatch[1].match(/"([^"]+)"/g);
+        if (!quotedParts) continue;
+        const parts = quotedParts.map(s => s.slice(1, -1));
+
+        // Scan the function body in statement order for known decode primitives
+        const steps = [];
+        const stepRe = /=\s*atob\(\s*result\s*\)|result\.split\(''\)\.reverse\(\)\.join\(''\)|\(o\s*-\s*base\s*\+\s*(\d+)\)\s*%\s*26|charCode\s*-\s*\((\d+)\s*%\s*\(i\s*\+\s*(\d+)\)\)/g;
+        let m;
+        while ((m = stepRe.exec(body)) !== null) {
+            if (m[0].includes('atob')) {
+                steps.push({ op: 'base64' });
+            } else if (m[0].includes('reverse')) {
+                steps.push({ op: 'reverse' });
+            } else if (m[1] !== undefined) {
+                steps.push({ op: 'rot', shift: parseInt(m[1], 10) });
+            } else {
+                steps.push({ op: 'unmix', magic: parseInt(m[2], 10), offset: parseInt(m[3], 10) });
+            }
+        }
+
+        if (steps.length > 0) {
+            decoders.push({ steps, parts });
         }
     }
 
-    if (steps.length === 0) return null;
-    return { steps, parts };
+    return decoders;
 }
 
 /**
@@ -568,7 +577,14 @@ async function scrapeIframe(iframeSrc, fetchAudioTracks = false) {
     $('video track').each((i, el) => {
         const src = $(el).attr('src');
         if (src) {
-            const fullUrl = src.startsWith('http') ? src : EMBED_BASE + src;
+            // Resolve relative to the iframe URL so path-relative srcs work too;
+            // fall back to the embed host if the src is unparseable
+            let fullUrl;
+            try {
+                fullUrl = new URL(src, iframeSrc).href;
+            } catch {
+                fullUrl = src.startsWith('http') ? src : EMBED_BASE + src;
+            }
             result.subtitles.push({
                 id: `hdfc-${$(el).attr('srclang') || i}`,
                 lang: $(el).attr('srclang') || 'unknown',
@@ -585,20 +601,21 @@ async function scrapeIframe(iframeSrc, fetchAudioTracks = false) {
     // The embed page emits the decoder function and its encoded parts array in
     // plain sight; we parse the step chain and interpret it rather than relying
     // on a fixed variant order (steps/ROT shift/unmix magic rotate per page).
-    const inline = parseInlineDecoder(html);
-    if (inline) {
+    const inlineDecoders = parseInlineDecoder(html);
+    for (const decoder of inlineDecoders) {
         try {
-            const decoded = applyDecodeSteps(inline.parts, inline.steps);
+            const decoded = applyDecodeSteps(decoder.parts, decoder.steps);
             if (isValidVideoUrl(decoded)) {
                 result.videoUrl = decoded;
                 log.debug(`Video URL extracted from inline decoder: ${decoded.substring(0, 80)}...`);
-            } else {
-                log.debug('Inline decoder produced a non-URL result, falling back');
+                break;
             }
+            log.debug('Inline decoder produced a non-URL result, trying next candidate');
         } catch (e) {
             log.debug(`Inline decoder failed: ${e.message}`);
         }
-    } else {
+    }
+    if (inlineDecoders.length === 0) {
         log.debug('No inline dc_ decoder found in iframe');
     }
 
@@ -624,7 +641,7 @@ async function scrapeIframe(iframeSrc, fetchAudioTracks = false) {
                 log.debug(`Video URL extracted from packed JS: ${result.videoUrl.substring(0, 80)}...`);
             }
         }
-    } else {
+    } else if (!result.videoUrl) {
         log.debug('No packed JavaScript found in iframe');
     }
 
@@ -650,14 +667,14 @@ async function scrapeIframe(iframeSrc, fetchAudioTracks = false) {
     if (result.videoUrl && fetchAudioTracks) {
         try {
             const m3u8Content = await httpGet(result.videoUrl, iframeSrc);
-            const baseM3u8 = result.videoUrl.substring(0, result.videoUrl.lastIndexOf('/'));
             const audioRegex = /#EXT-X-MEDIA:TYPE=AUDIO.*?NAME="([^"]+)".*?URI="([^"]+)"/g;
             let match;
 
             while ((match = audioRegex.exec(m3u8Content)) !== null) {
+                // new URL() handles absolute, root-relative and path-relative URIs
                 result.audioTracks.push({
                     name: match[1],
-                    url: `${baseM3u8}/${match[2]}`
+                    url: new URL(match[2], result.videoUrl).href
                 });
             }
 

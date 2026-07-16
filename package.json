@@ -1,8 +1,12 @@
 {
   "name": "hdfilmcehennemi-addon",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "HDFilmCehennemi video ve altyazı çekici - Stremio Addon",
   "main": "addon.js",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node addon.js",
     "test": "node test.js"
