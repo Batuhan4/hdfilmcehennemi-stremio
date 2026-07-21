@@ -6,6 +6,7 @@
  * @module scraper
  */
 
+const crypto = require('crypto');
 const { fetch } = require('undici');
 const cheerio = require('cheerio');
 const { createLogger } = require('./logger');
@@ -769,6 +770,27 @@ async function scrapeIframe(iframeSrc, fetchAudioTracks = false) {
             }
 
             log.debug(`Found ${result.audioTracks.length} audio tracks`);
+
+            // Parse the VIDEO-ONLY variant (the #EXT-X-STREAM-INF entry, which
+            // references the audio group but whose own playlist carries only
+            // video segments). The server-side mux feeds ffmpeg THIS variant —
+            // not the whole master — so ffmpeg doesn't also auto-pull the
+            // master's DEFAULT audio rendition (a wasteful second CDN fetch).
+            // Pick the highest-bandwidth variant when several are listed.
+            const streamRegex = /#EXT-X-STREAM-INF:([^\r\n]*)\r?\n\s*([^\s#][^\r\n]*)/g;
+            let bestBw = -1;
+            let sMatch;
+            while ((sMatch = streamRegex.exec(m3u8Content)) !== null) {
+                const bwMatch = sMatch[1].match(/BANDWIDTH=(\d+)/);
+                const bw = bwMatch ? parseInt(bwMatch[1], 10) : 0;
+                if (bw >= bestBw) {
+                    bestBw = bw;
+                    result.videoVariantUrl = new URL(sMatch[2].trim(), result.videoUrl).href;
+                }
+            }
+            if (result.videoVariantUrl) {
+                log.debug(`Video-only variant: ${result.videoVariantUrl.substring(0, 80)}...`);
+            }
         } catch (error) {
             log.warn(`Failed to fetch m3u8: ${error.message}`);
         }
@@ -963,32 +985,63 @@ function toStremioStreams(result, title = 'HDFilmCehennemi', baseUrl = null) {
         return `${baseUrl}/proxy/m3u8?${params.toString()}`;
     };
 
-    // Detect a dual-audio master: a Turkish (dubbed) group + a non-Turkish
-    // (original) group. Only then does a dublaj/altyazı split make sense.
+    // Build a server-side mux URL: a per-session, seekable, incrementally
+    // published segmented-HLS remux of the VIDEO-ONLY variant + one chosen
+    // audio rendition into a single-track stream. This is the maximum-
+    // compatibility path for dual-language titles — the player never sees the
+    // HLS alternate-audio structure it mishandles. The URL points at
+    // /proxy/mux/<token>/index.m3u8; the token (hash of the input URLs) keys
+    // the ffmpeg session so repeated/seek requests reuse the same output. The
+    // input URLs ride as base64url query params so a reaped session restarts.
+    const videoInput = result.videoVariantUrl || result.videoUrl;
+    const buildMuxUrl = (audioUrl) => {
+        const token = crypto.createHash('sha1')
+            .update(`${videoInput}|${audioUrl}`).digest('hex').slice(0, 20);
+        const params = new URLSearchParams();
+        params.set('v', Buffer.from(videoInput).toString('base64url'));
+        params.set('a', Buffer.from(audioUrl).toString('base64url'));
+        params.set('ref', Buffer.from(referer).toString('base64url'));
+        return `${baseUrl}/proxy/mux/${token}/index.m3u8?${params.toString()}`;
+    };
+
+    // The muxed output is a fresh single-track HLS our own server produces
+    // (Range-seekable, no upstream Referer needed — ffmpeg injects it), so any
+    // player handles it. Still route through the streaming server (notWebReady)
+    // since it is served over the addon, not a public browser-native URL.
+    const mkMuxBehaviorHints = (bingeGroup) => ({
+        notWebReady: true,
+        ...(bingeGroup ? { bingeGroup } : {})
+    });
+
+    // Mux only when the title genuinely offers the split structure: a Turkish
+    // (dubbed) audio group + a non-Turkish (original) group AND a separate
+    // video-only variant to combine them with. If a source is already combined
+    // A+V (single audio, or no parseable video-only variant), fall through to
+    // the normal /proxy/m3u8 passthrough — no ffmpeg overhead.
     const audioTracks = result.audioTracks || [];
     const turkishAudio = audioTracks.find(t => /t[üu]rk/i.test(t.name));
     const originalAudio = audioTracks.find(t => t !== turkishAudio);
-    const canSplit = baseUrl && turkishAudio && originalAudio;
+    const canSplit = baseUrl && turkishAudio && originalAudio && result.videoVariantUrl;
 
     if (canSplit) {
-        // Each entry is a single-language audio master (the /proxy/m3u8 endpoint
-        // drops the other audio rendition). Turkish subtitles ride along in the
-        // Stremio subtitles[] array on both entries — clients fetch the VTTs
-        // directly (no referer needed), so no in-manifest SUBTITLES injection.
+        // Each entry is a server-muxed single-track stream: the video variant
+        // combined with exactly one audio rendition (Turkish for Dublaj, the
+        // original for Altyazı). Turkish subtitles ride along in the Stremio
+        // subtitles[] array — clients fetch the VTTs directly (no referer).
         return {
             streams: [
                 {
-                    url: buildProxyUrl({ audio: 'tr' }),
+                    url: buildMuxUrl(turkishAudio.url),
                     title: `🎙️ Türkçe Dublaj\n${title}`,
                     name: 'HDFilmCehennemi',
-                    behaviorHints: mkBehaviorHints('hdfc-dublaj'),
+                    behaviorHints: mkMuxBehaviorHints('hdfc-dublaj'),
                     subtitles
                 },
                 {
-                    url: buildProxyUrl({ audio: 'orig' }),
+                    url: buildMuxUrl(originalAudio.url),
                     title: `📝 Orijinal + Altyazı\n${title}`,
                     name: 'HDFilmCehennemi',
-                    behaviorHints: mkBehaviorHints('hdfc-altyazi'),
+                    behaviorHints: mkMuxBehaviorHints('hdfc-altyazi'),
                     subtitles
                 }
             ]
