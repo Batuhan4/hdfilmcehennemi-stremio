@@ -512,7 +512,30 @@ const MUX_CUT_EPSILON = 0.2;
 const MUX_FILE_RE = /^(index\.m3u8|seg\d{1,6}\.ts)$/; // path-traversal guard
 const MUX_TOKEN_RE = /^[A-Za-z0-9_-]{6,64}$/;
 
-/** token -> { proc, dir, createdAt, lastAccess, ended, exitCode, stderrTail, wallTimer } */
+// --- Seek spans -----------------------------------------------------------
+// A "span" is a SECOND, on-demand ffmpeg pass that starts producing at an
+// arbitrary segment index (not 0) after the user seeks far ahead of the main
+// sequential pass. We do NOT use ffmpeg -ss (video overshoots the intended
+// boundary ~2.3s; audio leaks stray leading packets then jumps → a huge PTS
+// discontinuity inside one TS, and output-side -ss does not fix it). Instead we
+// serve a tiny pre-sliced sub-playlist (over THIS Express server, so -headers
+// keeps working — it errors on a top-level file: input) covering only the span
+// window, and point a normal -c copy pass at it. Spans write into the SAME
+// session dir as the main pass; a span is killed once the main pass catches up
+// to it, it reaches EOF, it is replaced by a seek elsewhere, or it goes idle.
+const MUX_SPAN_LEN = parseInt(process.env.MUX_SPAN_LEN || '90', 10);            // segments per span window
+const MUX_REACH_LOOKAHEAD = parseInt(process.env.MUX_REACH_LOOKAHEAD || '60', 10); // wait on an existing producer if within this many segs of its frontier
+const MUX_SPAN_IDLE_MS = (parseInt(process.env.MUX_SPAN_IDLE_SEC || '90', 10)) * 1000; // speculative spans idle-reap faster than a session
+
+/**
+ * token -> {
+ *   proc, dir, createdAt, lastAccess, ended, exitCode, stderrTail, wallTimer,
+ *   segCount, ready, token, referer, videoUrl, audioUrl,
+ *   plan: { video:{durations[],urls[]}, audio:{durations[],urls[]}, total, cuts[] },
+ *   mainSpan: { proc, startIdx:0, frontier, ended, exitCode, createdAt, lastAccess },
+ *   spans: Map<startIdx, { proc, startIdx, ceiling, frontier, ended, exitCode, stderrTail, createdAt, lastAccess }>
+ * }
+ */
 const muxSessions = new Map();
 
 /**
@@ -560,33 +583,59 @@ log.info(`ffmpeg -extension_picky supported: ${MUX_EXTENSION_PICKY}`);
 try { fs.rmSync(MUX_TMP_ROOT, { recursive: true, force: true }); } catch { /* ignore */ }
 fs.mkdirSync(MUX_TMP_ROOT, { recursive: true });
 
-/** Number of sessions whose ffmpeg is still running. */
+/**
+ * TOTAL live ffmpeg processes across ALL sessions — main sequential passes plus
+ * every live seek span. A single session may hold two (main + one span), so this
+ * counts processes, not sessions; MUX_MAX_CONCURRENT is the process budget.
+ */
 function activeMuxCount() {
     let n = 0;
-    for (const s of muxSessions.values()) if (!s.ended) n++;
+    for (const s of muxSessions.values()) {
+        if (s.mainSpan && !s.mainSpan.ended) n++;
+        if (s.spans) for (const sp of s.spans.values()) if (!sp.ended) n++;
+    }
     return n;
 }
 
-/** Kill a session's ffmpeg and delete its temp dir. */
+/** seg index -> "segNNNNN.ts" file name (matches the -segment output pattern). */
+function segName(i) { return `seg${String(i).padStart(5, '0')}.ts`; }
+
+/** Kill just ONE span's ffmpeg WITHOUT tearing down the session dir or main pass. */
+function killSpan(token, startIdx) {
+    const s = muxSessions.get(token);
+    if (!s || !s.spans) return;
+    const sp = s.spans.get(startIdx);
+    if (!sp) return;
+    s.spans.delete(startIdx);
+    try { if (sp.proc && sp.proc.exitCode === null) sp.proc.kill('SIGKILL'); } catch { /* ignore */ }
+    sp.ended = true;
+}
+
+/** Kill a session's main ffmpeg AND all its spans, and delete its temp dir. */
 function killMuxSession(token) {
     const s = muxSessions.get(token);
     if (!s) return;
     muxSessions.delete(token);
     try { if (s.proc && s.proc.exitCode === null) s.proc.kill('SIGKILL'); } catch { /* ignore */ }
+    if (s.spans) for (const sp of s.spans.values()) {
+        try { if (sp.proc && sp.proc.exitCode === null) sp.proc.kill('SIGKILL'); } catch { /* ignore */ }
+        sp.ended = true;
+    }
     if (s.wallTimer) clearTimeout(s.wallTimer);
     try { fs.rmSync(s.dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
 /**
- * Fetch the VIDEO-ONLY variant playlist and parse its #EXTINF list into a mux
- * PLAN: the per-segment durations (authoritative), the exact total duration,
- * and the cut-points (cumulative boundaries, minus the final one) at which the
- * output must be split. HLS timing is video-PTS-driven, so the video variant is
- * the source of truth for both duration and segment boundaries.
- * @returns {Promise<{durations:number[], total:number, cuts:number[]}>}
+ * Fetch ONE variant playlist and parse it into { durations[], urls[] }: the
+ * per-segment #EXTINF durations plus each segment's ABSOLUTE source URL (the
+ * media URI following each #EXTINF, resolved against the playlist URL). The
+ * absolute URLs let us author pre-sliced span sub-playlists later without re-
+ * fetching the CDN. This is ONE cheap GET (mirrors the existing mux-plan fetch
+ * pattern: undici fetch + upstreamHeaders + a 15s timeout).
+ * @returns {Promise<{durations:number[], urls:string[]}>}
  */
-async function fetchMuxPlan(videoUrl, referer) {
-    const resp = await fetch(videoUrl, {
+async function fetchVariant(url, referer) {
+    const resp = await fetch(url, {
         headers: upstreamHeaders(referer),
         signal: AbortSignal.timeout(15000)
     });
@@ -594,16 +643,60 @@ async function fetchMuxPlan(videoUrl, referer) {
     const text = await resp.text();
 
     const durations = [];
-    for (const line of text.split('\n')) {
-        const m = line.match(/^#EXTINF:\s*([\d.]+)/);
-        if (m) durations.push(parseFloat(m[1]));
+    const urls = [];
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(/^#EXTINF:\s*([\d.]+)/);
+        if (!m) continue;
+        // The media URI is the next non-empty, non-comment line after #EXTINF.
+        let uri = null;
+        for (let j = i + 1; j < lines.length; j++) {
+            const t = lines[j].trim();
+            if (t === '' || t.startsWith('#')) continue;
+            uri = t;
+            break;
+        }
+        if (uri === null) continue;
+        durations.push(parseFloat(m[1]));
+        try { urls.push(new URL(uri, url).href); } catch { urls.push(uri); }
     }
-    if (durations.length === 0) throw new Error('no #EXTINF in variant playlist');
+    return { durations, urls };
+}
 
-    // Cut-points = cumulative durations EXCLUDING the final boundary (the last
-    // segment runs to EOF, needs no forced cut). N durations -> N-1 cut-points
-    // -> N output segments, one per input segment. Each cut is nudged earlier by
-    // MUX_CUT_EPSILON so it reliably snaps to its intended keyframe (see const).
+/**
+ * Compute the mux PLAN from BOTH variants. Fetches the VIDEO-ONLY variant and
+ * the chosen AUDIO rendition (two cheap, SERIALIZED GETs — video first), keeps
+ * each track's durations AND absolute segment URLs, and derives the exact total
+ * duration and the output cut-points from the VIDEO track (HLS timing is video-
+ * PTS-driven, so the video variant is the source of truth for the boundaries).
+ *
+ * Video and audio variants have equal entry counts and index-aligned start
+ * times, so the SAME plan index slices both tracks (verified: index 359 =
+ * 1795.70s video vs 1795.01s audio — well within one segment).
+ * @returns {Promise<{video:{durations:number[],urls:string[]}, audio:{durations:number[],urls:string[]}, total:number, cuts:string[]}>}
+ */
+async function fetchMuxPlan(videoUrl, audioUrl, referer) {
+    const video = await fetchVariant(videoUrl, referer);   // serialized: video...
+    const audio = await fetchVariant(audioUrl, referer);   // ...then audio (polite, no burst)
+    if (video.durations.length === 0) throw new Error('no #EXTINF in video variant playlist');
+    if (audio.durations.length === 0) throw new Error('no #EXTINF in audio variant playlist');
+
+    const cuts = computeCuts(video.durations);
+    const total = video.durations.reduce((a, b) => a + b, 0);
+    return { video, audio, total, cuts };
+}
+
+/**
+ * Cut-points for a run of segment durations = cumulative durations EXCLUDING the
+ * final boundary (the last segment runs to EOF, needs no forced cut). N
+ * durations -> N-1 cut-points -> N output segments, one per input segment. Each
+ * cut is nudged earlier by MUX_CUT_EPSILON so it reliably snaps to its intended
+ * keyframe (see const). Cuts are RELATIVE to the run's start (0-based), which is
+ * exactly what a span pass needs (its input starts at time 0 via -start_at_zero)
+ * and what the main pass needs (its run starts at index 0).
+ * @returns {string[]} cut times as fixed(6) strings
+ */
+function computeCuts(durations) {
     const cuts = [];
     let acc = 0;
     let prev = 0;
@@ -614,8 +707,7 @@ async function fetchMuxPlan(videoUrl, referer) {
         cuts.push(cut.toFixed(6));
         prev = cut;
     }
-    const total = durations.reduce((a, b) => a + b, 0);
-    return { durations, total, cuts };
+    return cuts;
 }
 
 /**
@@ -656,7 +748,16 @@ function startMuxSession(token, videoUrl, audioUrl, referer) {
     const session = {
         proc: null, dir, createdAt: Date.now(), lastAccess: Date.now(),
         ended: false, exitCode: null, stderrTail: '', wallTimer: null,
-        segCount: 0, ready: null
+        segCount: 0, ready: null,
+        token, referer, videoUrl, audioUrl,
+        plan: null,
+        // The main sequential pass, tracked as a producer alongside any spans.
+        mainSpan: {
+            proc: null, startIdx: 0, frontier: 0,
+            ended: false, exitCode: null, createdAt: Date.now(), lastAccess: Date.now()
+        },
+        // startIdx -> span record (on-demand seek passes). Cap: <=1 LIVE span.
+        spans: new Map()
     };
     muxSessions.set(token, session);
 
@@ -667,13 +768,16 @@ function startMuxSession(token, videoUrl, audioUrl, referer) {
     }, MUX_WALLCLOCK_MS);
 
     session.ready = (async () => {
-        // A. Compute the plan from the video variant (one cheap GET).
-        const plan = await fetchMuxPlan(videoUrl, referer);
-        session.segCount = plan.durations.length;
-        log.info(`Mux plan [${token}]: ${plan.durations.length} segments, ${plan.total.toFixed(1)}s total`);
+        // A. Compute the plan from BOTH variants (two cheap, serialized GETs).
+        //    We keep each track's absolute segment URLs so seek spans can slice
+        //    sub-playlists later without re-hitting the CDN.
+        const plan = await fetchMuxPlan(videoUrl, audioUrl, referer);
+        session.plan = plan;
+        session.segCount = plan.video.durations.length;
+        log.info(`Mux plan [${token}]: ${plan.video.durations.length} segments, ${plan.total.toFixed(1)}s total`);
 
         // C. Author the complete VOD playlist upfront (ENDLIST from byte one).
-        fs.writeFileSync(path.join(dir, 'index.m3u8'), buildVodPlaylist(plan.durations));
+        fs.writeFileSync(path.join(dir, 'index.m3u8'), buildVodPlaylist(plan.video.durations));
 
         // B. One continuous -c copy pass; OUTPUT cut on the exact plan
         // boundaries via the segment muxer. Inputs unchanged: -f hls forces the
@@ -707,14 +811,19 @@ function startMuxSession(token, videoUrl, audioUrl, referer) {
         } catch (err) {
             session.ended = true;
             session.exitCode = -1;
+            session.mainSpan.ended = true;
+            session.mainSpan.exitCode = -1;
             throw err;
         }
         session.proc = proc;
+        session.mainSpan.proc = proc;
 
         proc.on('error', (err) => {             // ENOENT etc arrive async here
             log.error(`ffmpeg process error [${token}]: ${err.message}`);
             session.ended = true;
             session.exitCode = -1;
+            session.mainSpan.ended = true;
+            session.mainSpan.exitCode = -1;
         });
         proc.stderr.on('data', (chunk) => {
             const s = chunk.toString();
@@ -724,6 +833,8 @@ function startMuxSession(token, videoUrl, audioUrl, referer) {
         proc.on('close', (code) => {
             session.ended = true;
             session.exitCode = code;
+            session.mainSpan.ended = true;
+            session.mainSpan.exitCode = code;
             if (code && code !== 0) log.error(`ffmpeg exited ${code} [${token}]: ${session.stderrTail.trim()}`);
             else log.info(`ffmpeg finished [${token}] (mux complete)`);
         });
@@ -734,20 +845,190 @@ function startMuxSession(token, videoUrl, audioUrl, referer) {
     session.ready.catch((err) => {
         log.error(`Mux start failed [${token}]: ${err.message}`);
         session.ended = true;
+        session.mainSpan.ended = true;
         if (session.exitCode === null) session.exitCode = -1;
+        if (session.mainSpan.exitCode === null) session.mainSpan.exitCode = -1;
     });
 
     log.info(`Mux start [${token}]: v=${videoUrl.substring(0, 55)}... a=${audioUrl.substring(0, 55)}...`);
     return session;
 }
 
-/** Reaper: drop sessions that are idle or past the wall-clock cap. */
+/**
+ * Author a tiny VOD sub-playlist for a span window [startIdx, endIdx) of one
+ * track, listing the ABSOLUTE CDN segment URLs directly. Served over THIS Express
+ * server so ffmpeg reads it as an ordinary HTTP input (keeping -headers working,
+ * which errors on a top-level file: input) while its child segment fetches go
+ * straight to the CDN with the Referer/Origin block. Its #EXT-X-MEDIA-SEQUENCE is
+ * startIdx so the sequence numbers line up with the master index.m3u8.
+ */
+function buildSpanPlaylist(track, startIdx, endIdx) {
+    const durs = track.durations.slice(startIdx, endIdx);
+    const urls = track.urls.slice(startIdx, endIdx);
+    const target = Math.max(1, Math.ceil(Math.max(...durs)));
+    const lines = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:3',
+        '#EXT-X-PLAYLIST-TYPE:VOD',
+        `#EXT-X-TARGETDURATION:${target}`,
+        `#EXT-X-MEDIA-SEQUENCE:${startIdx}`
+    ];
+    for (let i = 0; i < urls.length; i++) {
+        lines.push(`#EXTINF:${durs[i].toFixed(6)},`);
+        lines.push(urls[i]);
+    }
+    lines.push('#EXT-X-ENDLIST');
+    return lines.join('\n') + '\n';
+}
+
+/**
+ * Advance a producer's cached frontier by scanning contiguously from where we
+ * left off. frontier = the first MISSING segment index, i.e. seg files for
+ * [startIdx, frontier) exist on disk. Cheap and amortized (the scan resumes from
+ * the last known frontier, not from startIdx). Main and spans write into the same
+ * dir but occupy disjoint index ranges, so a contiguous scan stops at the gap.
+ */
+function updateFrontier(dir, prod) {
+    let i = Math.max(prod.frontier, prod.startIdx);
+    while (fs.existsSync(path.join(dir, segName(i)))) i++;
+    prod.frontier = i;
+    return i;
+}
+
+/**
+ * Spawn a NEW seek span producing from startIdx. Mirrors the main pass exactly
+ * (same header block, same -extension_picky gate, same copy/segment flags) but
+ * points at our sliced span sub-playlists instead of the CDN variants, shifts the
+ * output numbering with -segment_start_number, and uses cuts re-based to the span
+ * start. NO -ss (see the span note above). Writes seg{startIdx..}.ts into the
+ * shared session dir. Registers and returns the span record.
+ */
+function spawnSpan(session, startIdx) {
+    const { token, dir, plan } = session;
+    const endIdx = Math.min(startIdx + MUX_SPAN_LEN, session.segCount);
+    const cuts = computeCuts(plan.video.durations.slice(startIdx, endIdx));
+
+    const base = `http://127.0.0.1:${PORT}/proxy/mux/${token}/span/${startIdx}`;
+    const headerBlock = ffmpegHeaderBlock(session.referer);
+    const pickyArgs = MUX_EXTENSION_PICKY ? ['-extension_picky', '0'] : [];
+    const args = ['-loglevel', 'error'];
+    if (headerBlock) args.push('-headers', headerBlock);
+    args.push('-f', 'hls', ...pickyArgs, '-i', `${base}/video.m3u8`);
+    if (headerBlock) args.push('-headers', headerBlock);
+    args.push('-f', 'hls', ...pickyArgs, '-i', `${base}/audio.m3u8`);
+    args.push(
+        '-map', '0:v:0',
+        '-map', '1:a:0',
+        '-c', 'copy',
+        '-copyts', '-start_at_zero', '-avoid_negative_ts', 'make_zero',
+        '-f', 'segment',
+        '-segment_format', 'mpegts',
+        '-segment_start_number', String(startIdx),
+        '-reset_timestamps', '0'
+    );
+    if (cuts.length > 0) args.push('-segment_times', cuts.join(','));
+    args.push(path.join(dir, 'seg%05d.ts'));
+
+    const span = {
+        proc: null, startIdx, ceiling: session.segCount, frontier: startIdx,
+        ended: false, exitCode: null, stderrTail: '',
+        createdAt: Date.now(), lastAccess: Date.now()
+    };
+    session.spans.set(startIdx, span);
+
+    let proc;
+    try {
+        proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch (err) {
+        log.error(`Mux span spawn error [${token}] @${startIdx}: ${err.message}`);
+        span.ended = true;
+        span.exitCode = -1;
+        return span;
+    }
+    span.proc = proc;
+    proc.on('error', (err) => {
+        log.error(`ffmpeg span process error [${token}] @${startIdx}: ${err.message}`);
+        span.ended = true;
+        span.exitCode = -1;
+    });
+    proc.stderr.on('data', (chunk) => {
+        const s = chunk.toString();
+        span.stderrTail = (span.stderrTail + s).slice(-2000);
+        log.warn(`ffmpeg span [${token}] @${startIdx}: ${s.trim()}`);
+    });
+    proc.on('close', (code) => {
+        span.ended = true;
+        span.exitCode = code;
+        if (code && code !== 0) log.error(`ffmpeg span exited ${code} [${token}] @${startIdx}: ${span.stderrTail.trim()}`);
+        else log.info(`ffmpeg span finished [${token}] @${startIdx}`);
+    });
+    log.info(`Mux span spawn [${token}]: start=${startIdx} end=${endIdx}`);
+    return span;
+}
+
+/**
+ * Ensure SOME live producer is working toward segIdx, and return it (or null if
+ * none can be provided right now). Resolution:
+ *   1. Main pass catch-up: if it has reached a span's start, that span is
+ *      redundant → kill it (prevents two ffmpeg racing on the same seg file).
+ *   2. Within the main pass's reach (segIdx close to its frontier) → main.
+ *   3. Within a live span's reach → that span (REUSE, no duplicate spawn).
+ *   4. Otherwise → replace any existing span (cap <=1 live) and spawn a fresh one
+ *      at segIdx, provided the global ffmpeg budget allows.
+ */
+function ensureProducer(session, segIdx) {
+    const { dir, mainSpan, spans } = session;
+
+    updateFrontier(dir, mainSpan);
+    // (1) Main caught up to a span → the span's job is done; drop it.
+    for (const sp of spans.values()) {
+        if (!sp.ended && mainSpan.frontier >= sp.startIdx) killSpan(session.token, sp.startIdx);
+    }
+
+    // (2) Main pass will reach segIdx soon (or already has) — wait on it.
+    if (!mainSpan.ended && segIdx <= mainSpan.frontier + MUX_REACH_LOOKAHEAD) {
+        return mainSpan;
+    }
+
+    // (3) A live span already covers segIdx within reach — reuse it.
+    for (const sp of spans.values()) {
+        if (sp.ended) continue;
+        updateFrontier(dir, sp);
+        if (segIdx >= sp.startIdx && segIdx <= sp.frontier + MUX_REACH_LOOKAHEAD) return sp;
+    }
+
+    // (4) Need a fresh span. Enforce the cap: kill every existing span first so a
+    // scrub elsewhere never accumulates producers (<=2 ffmpeg per session).
+    for (const startIdx of [...spans.keys()]) killSpan(session.token, startIdx);
+    if (activeMuxCount() >= MUX_MAX_CONCURRENT) {
+        log.warn(`Mux ffmpeg budget (${MUX_MAX_CONCURRENT}) reached; cannot spawn span [${session.token}] @${segIdx}`);
+        return null;
+    }
+    return spawnSpan(session, segIdx);
+}
+
+/** Reaper: drop idle/expired sessions, and reap redundant/idle/finished spans. */
 setInterval(() => {
     const now = Date.now();
     for (const [token, s] of muxSessions) {
         if (now - s.lastAccess > MUX_IDLE_MS || now - s.createdAt > MUX_WALLCLOCK_MS) {
             log.info(`Reaping mux session [${token}] (idle ${Math.round((now - s.lastAccess) / 1000)}s)`);
             killMuxSession(token);
+            continue;
+        }
+        if (!s.spans) continue;
+        if (s.mainSpan) updateFrontier(s.dir, s.mainSpan);
+        for (const sp of [...s.spans.values()]) {
+            if (sp.ended) { s.spans.delete(sp.startIdx); continue; }
+            updateFrontier(s.dir, sp);
+            // Main caught up → redundant; reached its ceiling (EOF) → done; own
+            // requests went idle → speculative work no longer wanted.
+            if ((s.mainSpan && s.mainSpan.frontier >= sp.startIdx) ||
+                sp.frontier >= sp.ceiling ||
+                now - sp.lastAccess > MUX_SPAN_IDLE_MS) {
+                log.info(`Reaping mux span [${token}] @${sp.startIdx} (frontier ${sp.frontier}/${sp.ceiling})`);
+                killSpan(token, sp.startIdx);
+            }
         }
     }
 }, 60000).unref();
@@ -822,12 +1103,15 @@ async function muxHandler(req, res) {
         return res.send(fs.readFileSync(indexPath, 'utf-8'));
     }
 
-    // Segment request. Bounded-wait for ffmpeg's sequential pass to reach it,
-    // rather than 404-ing — this is what stops the player buffering-vs-EOF bug.
+    // Segment request. Bounded-wait for SOME producer (the main sequential pass
+    // near its frontier, or an on-demand seek span) to write the segment, rather
+    // than 404-ing — this is what stops the player buffering-vs-EOF bug, and the
+    // span mechanism is what stops a far-ahead resume-seek from stalling the main
+    // pass into a 504 (the crash the whole subsystem is here to fix).
     if (!session) return res.status(410).send('Mux session gone');
     session.lastAccess = Date.now();
 
-    // Wait for startup so we know the total segment count.
+    // Wait for startup so we know the total segment count and have the plan.
     try {
         await session.ready;
     } catch {
@@ -836,22 +1120,38 @@ async function muxHandler(req, res) {
 
     const segIdx = parseInt(file.slice(3, -3), 10); // "seg00042.ts" -> 42
     const segPath = path.join(session.dir, file);
-    // A segment is COMPLETE once the next one has been opened (segment muxer
-    // closes seg N when it starts seg N+1) OR the whole mux has ended. Serving a
+    // A segment is COMPLETE once the next one has been opened (the segment muxer
+    // closes seg N when it starts seg N+1) OR its producer has ended. Serving a
     // still-being-written current segment would hand the player a short read.
     const isLast = segIdx >= session.segCount - 1;
-    const nextPath = path.join(session.dir, `seg${String(segIdx + 1).padStart(5, '0')}.ts`);
+    const nextPath = path.join(session.dir, segName(segIdx + 1));
     const deadline = Date.now() + MUX_SEGMENT_WAIT_MS;
 
     while (true) {
         const exists = fs.existsSync(segPath);
-        const complete = exists && (session.ended || (!isLast && fs.existsSync(nextPath)));
-        if (complete) break;
+
+        // (1) Already complete on disk (any producer) → serve immediately.
+        if (exists && (fs.existsSync(nextPath) || isLast)) break;
+
+        // (2/3/4) Make sure a producer is working toward this index (reuse main /
+        // reuse a live span / spawn a fresh span, respecting the <=1-span cap).
+        const cover = ensureProducer(session, segIdx);
         session.lastAccess = Date.now();               // keep the reaper off while a client waits
-        if (session.ended) {
-            // ffmpeg done: if the file is here it's complete; else it never came.
+        if (cover) cover.lastAccess = Date.now();
+
+        // Re-check completeness now that we know the covering producer: an
+        // existing file whose producer has ended is final (last seg / early stop).
+        if (exists && (fs.existsSync(nextPath) || isLast || (cover && cover.ended))) break;
+
+        if (!cover) {
+            // No producer available (global ffmpeg budget exhausted). If the file
+            // happens to be here, serve it; otherwise fail rather than hang.
             if (exists) break;
-            return res.status(session.exitCode === 0 ? 404 : 502).end();
+            return res.status(503).send('Mux busy, try again shortly');
+        }
+        if (cover.ended && !exists) {
+            // The covering producer finished without ever writing this segment.
+            return res.status(cover.exitCode === 0 ? 404 : 502).end();
         }
         if (Date.now() > deadline) {
             log.warn(`Segment wait timeout [${token}] ${file}`);
@@ -866,6 +1166,34 @@ async function muxHandler(req, res) {
     });
 }
 
+/**
+ * Span sub-playlist handler — serves a tiny pre-sliced VOD playlist for a seek
+ * span, generated on-request from session.plan (never persisted). Only ffmpeg
+ * (spawned by spawnSpan) fetches these, from 127.0.0.1.
+ * Route: /proxy/mux/:token/span/:n/:file  (:file = video.m3u8 | audio.m3u8)
+ */
+function spanPlaylistHandler(req, res) {
+    const { token, n, file } = req.params;
+    if (!MUX_TOKEN_RE.test(token) || !/^\d{1,6}$/.test(n) ||
+        (file !== 'video.m3u8' && file !== 'audio.m3u8')) {
+        return res.status(400).send('Bad span request');
+    }
+    const session = muxSessions.get(token);
+    if (!session || !session.plan) return res.status(404).send('No mux plan');
+
+    const track = file === 'video.m3u8' ? session.plan.video : session.plan.audio;
+    const startIdx = parseInt(n, 10);
+    if (startIdx >= track.durations.length) return res.status(404).send('Span out of range');
+    const endIdx = Math.min(startIdx + MUX_SPAN_LEN, track.durations.length);
+
+    res.set('Content-Type', 'application/vnd.apple.mpegurl');
+    res.set('Cache-Control', 'no-cache');
+    return res.send(buildSpanPlaylist(track, startIdx, endIdx));
+}
+
+// Span sub-playlists are more specific than the generic :file route; register
+// first. (Their extra path segments mean Express would not confuse them anyway.)
+app.get('/proxy/mux/:token/span/:n/:file', spanPlaylistHandler);
 app.get('/proxy/mux/:token/:file', muxHandler);
 
 // Mount Stremio addon router
